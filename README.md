@@ -24,7 +24,7 @@ pip install distributed-kron
 ## Basic Usage (Kron)
 
 Kron schedules the preconditioner update probability by default to start at 1.0 and anneal to 0.03 
-at the beginning of training, so training will be slightly slower at the start but will speed up 
+during the first 4k steps of training, so training will be slightly slower at the start but will speed up 
 by around 4k steps.
 
 For basic usage, use `distributed_kron.kron` optimizer like any other optax optimizer:
@@ -75,16 +75,7 @@ This is roughly the default schedule defined in the `precond_update_prob_schedul
 **Sharding:**
 
 Kron contains einsums, and in general the first axis of the preconditioner matrices is the 
-contracting axis.
-
-If using only FSDP, I usually shard the last axis of each preconditioner matrix and call it good.
-
-However, if using tensor parallelism in addition to FSDP, you may think more carefully about how 
-the preconditioners are sharded in train_state. For example, with grads of shape (256, 128) and kron 
-preconditioners of shapes (256, 256) and (128, 128), if the grads are sharded as (fsdp, tensor), 
-then you may want to shard the (256, 256) preconditioner as (fsdp, tensor) and the (128, 128) 
-preconditioner as (tensor, fsdp) so the grads and its preconditioners have similar contracting axes.
-
+contracting axis, so the best setting for preconditioner sharding is equivalent to P('fsdp', None)
 
 **Scanned layers:**
 
