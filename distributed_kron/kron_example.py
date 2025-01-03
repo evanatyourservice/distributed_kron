@@ -29,14 +29,14 @@ def main(
     mesh = Mesh(devices, ("fsdp", "pipeline"))
 
     params_sharding = {
-        "w1": NS(mesh, P("pipeline", None, "fsdp")),  # kron maintains pipeline sharding
+        "w1_scan": NS(mesh, P("pipeline", None, "fsdp")),  # kron maintains pipeline sharding
         "w2": NS(mesh, P("fsdp", None, None)),
         "b1": NS(mesh, P(None)),
     }
 
     # some inputs for kron
     params_sharding_in = jax.tree.map(lambda x: x.spec, params_sharding)  # only specs, not sharding
-    scanned_layers = {"w1": True, "w2": False, "b1": False}  # which layers in model are scanned
+    scanned_layers = {"w1_scan": True, "w2": False, "b1": False}  # which layers in model are scanned
     preconditioner_sharding = P("fsdp", None)  # explicitly set sharding for preconditioners
 
     opt_kwargs = dict(
@@ -66,7 +66,7 @@ def main(
     optimizer = kron(**opt_kwargs)
 
     def init_train_state():
-        params = {"w1": jnp.ones((2, 1024, 4096)), "w2": jnp.ones((4096, 1000, 2)), "b1": jnp.ones(4096)}
+        params = {"w1_scan": jnp.ones((2, 512, 1024)), "w2": jnp.ones((1024, 500, 2)), "b1": jnp.ones(1024)}
         opt_state = optimizer.init(params)
         return {"params": params, "opt_state": opt_state}
 

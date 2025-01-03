@@ -9,12 +9,18 @@ import jax
 from jax import numpy as jnp, vmap
 from jax.sharding import PartitionSpec
 from jax.lax import with_sharding_constraint
-import flax.linen as nn
 from optax import tree_utils as otu
 from optax._src import base, transform, numerics
 from optax._src.numerics import safe_int32_increment
 from optax._src.utils import canonicalize_dtype
 from optax._src.combine import chain
+
+have_flax = False
+try:
+    import flax.linen as nn
+    have_flax = True
+except ImportError:
+    nn = None
 
 
 def precond_update_prob_schedule(
@@ -122,11 +128,12 @@ def scale_by_kron(
         have_qs_sharding = have_params_sharding or preconditioner_sharding is not None
 
         # unbox if flax style partitioned
-        params = jax.tree.map(
-            lambda x: x.unbox() if isinstance(x, nn.Partitioned) else x,
-            params,
-            is_leaf=lambda x: isinstance(x, nn.Partitioned),
-        )
+        if have_flax:
+            params = jax.tree.map(
+                lambda x: x.unbox() if isinstance(x, nn.Partitioned) else x,
+                params,
+                is_leaf=lambda x: isinstance(x, nn.Partitioned),
+            )
 
         # check that there is a PartitionSpec for every param
         if params_sharding is not None:
@@ -349,17 +356,18 @@ def scale_by_kron(
         have_qs_sharding = have_params_sharding or preconditioner_sharding is not None
 
         # unbox if flax style partitioned
-        boxed_updates, grads_structure = jax.tree.flatten(
-            updates,
-            is_leaf=lambda g: isinstance(
-                g, (chex.Array, nn.Partitioned, jax.ShapeDtypeStruct)
-            ),
-        )
         flax_partitioned = False
-        if isinstance(boxed_updates[0], nn.Partitioned):
-            flax_partitioned = True
-            updates = [g.unbox() for g in boxed_updates]
-            updates = grads_structure.unflatten(updates)
+        if have_flax:
+            boxed_updates, grads_structure = jax.tree.flatten(
+                updates,
+                is_leaf=lambda g: isinstance(
+                    g, (chex.Array, nn.Partitioned, jax.ShapeDtypeStruct)
+                ),
+            )
+            if isinstance(boxed_updates[0], nn.Partitioned):
+                flax_partitioned = True
+                updates = [g.unbox() for g in boxed_updates]
+                updates = grads_structure.unflatten(updates)
 
         # extend partition specs
         params_sharding_ = params_sharding
@@ -894,8 +902,9 @@ def get_opt_state_partition_specs(
         tree of PartitionSpecs for optimizer state.
     """
     params_flat, params_struct = jax.tree.flatten(params)
-    if isinstance(params_flat[0], nn.Partitioned):
-        params_flat = [p.unbox(p) for p in params_flat]
+    if have_flax:
+        if isinstance(params_flat[0], nn.Partitioned):
+            params_flat = [p.unbox(p) for p in params_flat]
     if not isinstance(params_flat[0], jax.ShapeDtypeStruct):
         params_flat = [jax.ShapeDtypeStruct(p.shape, p.dtype) for p in params_flat]
     params = params_struct.unflatten(params_flat)

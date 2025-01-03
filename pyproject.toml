@@ -34,7 +34,6 @@ dependencies = [
     "chex",
     "jax",
     "jaxlib",
-    "flax",
     "optax",
 ]
 
