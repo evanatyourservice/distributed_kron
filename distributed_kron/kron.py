@@ -67,7 +67,7 @@ def scale_by_kron(
     merge_small_dims: bool = True,
     target_merged_dim_size: int = 4096,
     partition_grads_into_blocks: bool = True,
-    block_size: int = 512,
+    block_size: int = 256,
     params_sharding: Optional[Any] = None,
     preconditioner_sharding: Optional[PartitionSpec[str, str]] = None,
     **kwargs,
@@ -806,7 +806,7 @@ def kron(
     merge_small_dims: bool = True,
     target_merged_dim_size: int = 4096,
     partition_grads_into_blocks: bool = True,
-    block_size: int = 512,
+    block_size: int = 256,
     params_sharding: Optional[Any] = None,
     preconditioner_sharding: Optional[PartitionSpec[str, str]] = None,
 ) -> base.GradientTransformation:
