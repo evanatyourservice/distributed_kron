@@ -6,8 +6,8 @@ Implementation of [PSGD Kron](https://github.com/lixilinx/psgd_torch) in JAX (op
 distributed training. PSGD is a second-order optimizer originally created by Xi-Lin Li that uses either 
 a hessian-based or whitening-based (gg^T) preconditioner, lie groups, and online preconditioner updating 
 to improve training convergence, generalization, and efficiency. I highly suggest taking a look at 
-Xi-Lin's PSGD repo's readme linked above for interesting details on how PSGD works and experiments using PSGD. 
-There are also paper resources listed near the bottom of this readme.
+Xi-Lin's PSGD repo linked above for interesting details on how PSGD works and experiments using PSGD. 
+There are also resources listed near the bottom of this readme.
 
 ### `distributed_kron`:
 
@@ -15,9 +15,9 @@ The most versatile and easy-to-use PSGD optimizer is `kron`, which uses a Kronec
 preconditioner. It has less hyperparameters that need tuning than adam, and can generally act as a 
 drop-in replacement.
 
-Distributed kron is a version of kron meant for large scale distributed training in JAX. It uses 
-merging of dimensions, vmapping of layers, partitioning of grads, and sharding constraints to allow
-for efficient, second-order training of large models.
+Distributed kron is a version of kron meant for large scale distributed training in JAX. It uses merging of
+dimensions, vmapping of layers, partitioning of grads, and sharding constraints to allow for efficient, 
+second-order training of large models.
 
 
 ## Installation
