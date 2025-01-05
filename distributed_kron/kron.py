@@ -18,6 +18,7 @@ from optax._src.combine import chain
 have_flax = False
 try:
     import flax.linen as nn
+
     have_flax = True
 except ImportError:
     nn = None
@@ -70,53 +71,57 @@ def scale_by_kron(
     params_sharding: Optional[Any] = None,
     preconditioner_sharding: Optional[PartitionSpec[str, str]] = None,
     **kwargs,
-) -> base.GradientTransformationExtraArgs:
+) -> base.GradientTransformation:
     """
     Implements PSGD Kron from https://github.com/lixilinx/psgd_torch.
 
     Args:
-        b1: float, momentum parameter. 0.9 or 0.95 are common values.
-        preconditioner_update_probability: float, probability of updating the
+        `b1`: float, momentum parameter. 0.9 or 0.95 are common values.
+        `preconditioner_update_probability`: float, probability of updating the
             preconditioner. Default anneals from 1.0 to 0.03 by 4000 steps.
-        max_size_triangular: int, max size for dim's preconditioner to be triangular.
-        min_ndim_triangular: int, minimum number of dimensions a layer needs to have
-            triangular preconditioners.
-        memory_save_mode: optional str, None, 'one_diag', or 'all_diag', None is default
-            to set all preconditioners to be triangular, 'one_diag' sets the largest
-            or last dim to be diagonal per layer, and 'all_diag' sets all preconditioners
-            to be diagonal.
-        preconditioner_lr: float, learning rate for preconditioner.
-        preconditioner_init_scale: float, scale for preconditioner initialization.
-        mu_dtype: optional str or jnp.dtype, dtype of the momentum buffer. Defaults to
+        `max_size_triangular`: int, max size for a dimension's preconditioner to be
+            triangular. Any dim with size larger than this will be diagonal.
+        `min_ndim_triangular`: int, minimum number of dimensions a layer needs to have
+            triangular preconditioners. Any layers with fewer number of dimensions will
+            have all diagonal preconditioners.
+        `memory_save_mode`: optional str, None, 'one_diag', or 'all_diag', 'one_diag' sets
+            the largest or last dim to be diagonal per layer, and 'all_diag' sets all
+            preconditioners to be diagonal.
+        `preconditioner_lr`: float, learning rate for preconditioner.
+        `preconditioner_init_scale`: float, scale for preconditioner initialization.
+        `mu_dtype`: optional str or jnp.dtype, dtype of the momentum buffer. Defaults to
             same dtype as the parameters.
-        precond_dtype: optional str or jnp.dtype, dtype of the preconditioners. Defaults
+        `precond_dtype`: optional str or jnp.dtype, dtype of the preconditioners. Defaults
             to 'float32'.
-        precond_update_precision: str, precision for matmul during preconditioner update,
+        `precond_update_precision`: str, precision for matmul during preconditioner update,
              'bfloat16', 'tensorfloat32', 'float32'.
-        precond_grads_precision: str, precision for matmul during preconditioning grads,
+        `precond_grads_precision`: str, precision for matmul during preconditioning grads,
              'bfloat16', 'tensorfloat32', 'float32'.
-        scanned_layers: optional base.Params, tree of booleans same structure as
-            params indicating scanned dimensions for each layer. PSGD will vmap over
-            leading dimension.
-        lax_map_scanned_layers: bool, whether to use lax.map for scanned layers
-            instead of vmap. Useful to save memory with large models.
-        lax_map_batch_size: int, batch size for lax.map, see JAX docs for more info.
-        merge_small_dims: bool, whether to merge small dimensions to improve
+        `scanned_layers`: optional pytree, tree of booleans same structure as params
+            indicating which arrays are scanned in the model. PSGD will vmap over the
+            leading dimension of those arrays.
+        `lax_map_scanned_layers`: bool, whether to use `lax.map` for scanned arrays
+            instead of `vmap`. Useful to save memory with large models. See
+            `lax_map_batch_size` below for more info.
+        `lax_map_batch_size`: int, batch size for `lax.map`. `lax.map` will scan over
+            chunks of vmap of this size. See JAX docs for `lax.map` for more info.
+        `merge_small_dims`: bool, whether to merge small dimensions to improve
             preconditioner efficiency.
-        target_merged_dim_size: int, target size of merged dimensions.
-        partition_grads_into_blocks: bool, whether to partition grads into chunks of
-            size `block_size` for efficiency.
-        block_size: int, block size to use for partitioning grads.
-        params_sharding: pytree same structure as params of jax.sharding.PartitionSpec.
-        preconditioner_sharding: `None` or `PartitionSpec(str | None, str | None)`,
-            PartitionSpec for preconditioner matrices. `None` infers a strategy
-            from params_sharding that matches first preconditioner axis to
-            corresponding axis in params. Best practice, though, is to shard the first
-            dimension across fsdp-like mesh axis, or the largest, most common axis in
-            params. For example, PartitionSpec('fsdp') or PartitionSpec('fsdp', 'tp').
+        `target_merged_dim_size`: int, target size of merged dimensions.
+        `partition_grads_into_blocks`: bool, whether to partition grads into blocks of
+            size `block_size` for efficiency. These blocks are stacked and vmapped over
+            for faster compile and more efficient use of accelerators.
+        `block_size`: int, block size to use for partitioning grads.
+        `params_sharding`: pytree same structure as params of
+            `jax.sharding.PartitionSpec`. Used for internal sharding constraints.
+        `preconditioner_sharding`: `None` or `PartitionSpec(str | None, str | None)`,
+            `PartitionSpec` to define preconditioner sharding. `None` infers a so-so
+            strategy from `params_sharding`. However, best practice is to explicitly
+            set this hyperparameter to shard the first dimension across the fsdp-like
+            axis. For example, `PartitionSpec('fsdp')` or `PartitionSpec('fsdp', 'tp')`.
 
     Returns:
-        optax.GradientTransformationExtraArgs
+        optax.GradientTransformation
     """
     mu_dtype = canonicalize_dtype(mu_dtype)
     precond_dtype = canonicalize_dtype(precond_dtype or jnp.float32)
@@ -511,6 +516,7 @@ def scale_by_kron(
             )
             if have_params_sharding:
                 # constrain partitions to same sharding as entire layer
+                # TODO (evanatyourservice): find better way to do this
                 momentum_updates = jax.tree.map(
                     lambda _, g, mps: jax.tree.map(
                         lambda x: _safe_sharding_constraint(x, mps), g
@@ -628,13 +634,16 @@ def scale_by_kron(
 
                 # form conjB
                 conjBs = jax.tree.map(
-                    lambda g, Q, v, nm: _map_fn(lax_map, bs, nm, _conjB, Q, g, v),
+                    lambda g, Q, v, nm: _map_fn(
+                        lax_map, bs, nm, partial(_conjB, order=g.ndim), Q, v
+                    ),
                     grads_in,
                     Qs,
                     Vs,
                     n_dims_to_map,
                 )
                 if have_params_sharding:
+                    # seems jax often does this automatically, but let's set it anyway
                     conjBs = _safe_sharding_constraint(conjBs, partitioned_sharding)
 
                 # update Qs and constrain sharding
@@ -746,9 +755,7 @@ def scale_by_kron(
 
         # RMS of preconditioned grads should be 1.0, so let's cap at 1.1
         def _clip_fn(u):
-            clip_denom = jnp.maximum(
-                1.0,
-                jnp.sqrt(jnp.mean(numerics.abs_sq(u))) / 1.1)
+            clip_denom = jnp.maximum(1.0, jnp.sqrt(jnp.mean(numerics.abs_sq(u))) / 1.1)
             return u / clip_denom
 
         precond_gs = jax.tree.map(_clip_fn, precond_gs)
@@ -773,7 +780,7 @@ def scale_by_kron(
 
         return precond_gs, state
 
-    return base.GradientTransformationExtraArgs(init_fn, update_fn)
+    return base.GradientTransformation(init_fn, update_fn)
 
 
 def kron(
@@ -802,58 +809,57 @@ def kron(
     block_size: int = 512,
     params_sharding: Optional[Any] = None,
     preconditioner_sharding: Optional[PartitionSpec[str, str]] = None,
-) -> base.GradientTransformationExtraArgs:
+) -> base.GradientTransformation:
     """
     Implements PSGD Kron from https://github.com/lixilinx/psgd_torch.
 
     Args:
-        learning_rate: float or callable, learning rate schedule.
-        b1: float, momentum parameter. 0.9 or 0.95 are common values.
-        weight_decay: float, weight decay coefficient.
-        weight_decay_mask: optional pytree same structure as params, or callable
-            returning a pytree, that masks weight decay. Weight decay is applied to
-            leaves that are True.
-        preconditioner_update_probability: float, probability of updating the
+        `b1`: float, momentum parameter. 0.9 or 0.95 are common values.
+        `preconditioner_update_probability`: float, probability of updating the
             preconditioner. Default anneals from 1.0 to 0.03 by 4000 steps.
-        max_size_triangular: int, max size for dim's preconditioner to be triangular.
-        min_ndim_triangular: int, minimum number of dimensions a layer needs to have
-            triangular preconditioners.
-        memory_save_mode: optional str, None, 'one_diag', or 'all_diag', None is default
-            to set all preconditioners to be triangular, 'one_diag' sets the largest
-            or last dim to be diagonal per layer, and 'all_diag' sets all preconditioners
-            to be diagonal.
-        preconditioner_lr: float, learning rate for preconditioner.
-        preconditioner_init_scale: float, scale for preconditioner initialization.
-        mu_dtype: optional str or jnp.dtype, dtype of the momentum buffer. Defaults to
+        `max_size_triangular`: int, max size for a dimension's preconditioner to be
+            triangular. Any dim with size larger than this will be diagonal.
+        `min_ndim_triangular`: int, minimum number of dimensions a layer needs to have
+            triangular preconditioners. Any layers with fewer number of dimensions will
+            have all diagonal preconditioners.
+        `memory_save_mode`: optional str, None, 'one_diag', or 'all_diag', 'one_diag' sets
+            the largest or last dim to be diagonal per layer, and 'all_diag' sets all
+            preconditioners to be diagonal.
+        `preconditioner_lr`: float, learning rate for preconditioner.
+        `preconditioner_init_scale`: float, scale for preconditioner initialization.
+        `mu_dtype`: optional str or jnp.dtype, dtype of the momentum buffer. Defaults to
             same dtype as the parameters.
-        precond_dtype: optional str or jnp.dtype, dtype of the preconditioners. Defaults
+        `precond_dtype`: optional str or jnp.dtype, dtype of the preconditioners. Defaults
             to 'float32'.
-        precond_update_precision: str, precision for matmul during preconditioner update,
+        `precond_update_precision`: str, precision for matmul during preconditioner update,
              'bfloat16', 'tensorfloat32', 'float32'.
-        precond_grads_precision: str, precision for matmul during preconditioning grads,
+        `precond_grads_precision`: str, precision for matmul during preconditioning grads,
              'bfloat16', 'tensorfloat32', 'float32'.
-        scanned_layers: optional base.Params, tree of booleans same structure as
-            params indicating scanned dimensions for each layer. PSGD will vmap over
-            leading dimension.
-        lax_map_scanned_layers: bool, whether to use lax.map for scanned layers
-            instead of vmap. Useful to save memory with large models.
-        lax_map_batch_size: int, batch size for lax.map, see JAX docs for more info.
-        merge_small_dims: bool, whether to merge small dimensions to improve
+        `scanned_layers`: optional pytree, tree of booleans same structure as params
+            indicating which arrays are scanned in the model. PSGD will vmap over the
+            leading dimension of those arrays.
+        `lax_map_scanned_layers`: bool, whether to use `lax.map` for scanned arrays
+            instead of `vmap`. Useful to save memory with large models. See
+            `lax_map_batch_size` below for more info.
+        `lax_map_batch_size`: int, batch size for `lax.map`. `lax.map` will scan over
+            chunks of vmap of this size. See JAX docs for `lax.map` for more info.
+        `merge_small_dims`: bool, whether to merge small dimensions to improve
             preconditioner efficiency.
-        target_merged_dim_size: int, target size of merged dimensions.
-        partition_grads_into_blocks: bool, whether to partition grads into chunks of
-            size `block_size` for efficiency.
-        block_size: int, block size to use for partitioning grads.
-        params_sharding: pytree same structure as params of jax.sharding.PartitionSpec.
-        preconditioner_sharding: `None` or `PartitionSpec(str | None, str | None)`,
-            PartitionSpec for preconditioner matrices. `None` infers a strategy
-            from params_sharding that matches first preconditioner axis to
-            corresponding axis in params. Best practice, though, is to shard the first
-            dimension across fsdp-like mesh axis, or the largest, most common axis in
-            params. For example, PartitionSpec('fsdp') or PartitionSpec('fsdp', 'tp').
+        `target_merged_dim_size`: int, target size of merged dimensions.
+        `partition_grads_into_blocks`: bool, whether to partition grads into blocks of
+            size `block_size` for efficiency. These blocks are stacked and vmapped over
+            for faster compile and more efficient use of accelerators.
+        `block_size`: int, block size to use for partitioning grads.
+        `params_sharding`: pytree same structure as params of
+            `jax.sharding.PartitionSpec`. Used for internal sharding constraints.
+        `preconditioner_sharding`: `None` or `PartitionSpec(str | None, str | None)`,
+            `PartitionSpec` to define preconditioner sharding. `None` infers a so-so
+            strategy from `params_sharding`. However, best practice is to explicitly
+            set this hyperparameter to shard the first dimension across the fsdp-like
+            axis. For example, `PartitionSpec('fsdp')` or `PartitionSpec('fsdp', 'tp')`.
 
     Returns:
-        optax.GradientTransformationExtraArgs
+        optax.GradientTransformation
     """
     optimizer = [
         scale_by_kron(
@@ -888,15 +894,25 @@ def kron(
 def get_opt_state_partition_specs(
     params: base.Params, scale_by_kron_only: bool = False, **kwargs
 ):
-    """Get tree of PartitionSpecs for kron optimizer state.
+    """Get tree of PartitionSpecs for kron's optimizer state.
 
-    params converted to jax.ShapeDtypeStructs, no arrays are used.
+    Example:
+        ```python
+        kron_kwargs = {
+            "learning_rate": 0.0003,
+            "weight_decay": 0.01,
+        }
+        params_shapes = ...
+        specs = get_opt_state_partition_specs(
+            params_shapes, scale_by_kron_only=True, **kwargs
+        )
+        ```
 
     Args:
         params: pytree of Arrays, nn.Partitioned, or jax.ShapeDtypeStruct.
         scale_by_kron_only: bool, If True, only returns partition specs for the
             `scale_by_kron` function, otherwise the `kron` function.
-        kwargs: kwargs for kron (or scale_by_kron).
+        kwargs: All the kwargs for `kron` (or `scale_by_kron`).
 
     Returns:
         tree of PartitionSpecs for optimizer state.
@@ -1114,9 +1130,8 @@ def _solve_triangular_right(X, A):
     return solution
 
 
-def _conjB(Q, G, V):
+def _conjB(Q, V, order):
     """Compute conjB."""
-    order = G.ndim
     p = list(range(order))
     conjB = jnp.transpose(V, p[1:] + p[:1])
     for i, q in enumerate(Q):
