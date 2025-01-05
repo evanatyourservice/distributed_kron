@@ -32,6 +32,9 @@ FYI: Kron schedules the preconditioner update probability by default to start at
 during the first 4k steps of training, so training will be slightly slower at the start but will speed up 
 by around 4k steps.
 
+LR: Kron usually likes a learning rate around 3x smaller than adam's. Kron does not share adam's implicit warmup, 
+so a longer warmup schedule may be beneficial if divergence is seen early in training.
+
 For basic usage, use `distributed_kron.kron` optimizer like any other optax optimizer:
 
 ```python
@@ -48,9 +51,11 @@ params = optax.apply_updates(params, updates)
 
 For advanced usage, see the `kron_example.py` file.
 
-The main thing to note is that your workflow should include passing params sharding into kron through
-`params_sharding`, which will be used for internal sharding constraints. Also, it is best to explicitly
-set preconditioner sharding using `preconditioner_sharding` (see hyperparameters section below).
+The main thing to note is that your workflow should include passing params partition specs into kron through
+`params_partition_specs`, which will be used for internal sharding constraints. Also, it is best to explicitly
+set preconditioner partition specs using `preconditioner_partition_spec` (see hyperparameters section below).
+
+#### `get_opt_state_partition_specs`:
 
 If you need it, there is an optimizer state partition specs helper function
 `get_opt_state_partition_specs`:
@@ -62,21 +67,21 @@ kron_kwargs = dict(
     learning_rate=0.0003,
     weight_decay=0.01,
     scanned_layers=scanned_layers_pytree,
-    params_sharding=params_partition_specs,
-    preconditioner_sharding=P("fsdp", None),
+    params_partition_specs=params_partition_specs,
+    preconditioner_partition_spec=P("fsdp", None),
 )
 
 optimizer = kron(**kron_kwargs)
 
 opt_state_partition_specs = get_opt_state_partition_specs(
-    params=train_state_shapes["params"], scale_by_kron_only=False, **kron_kwargs
+    params=train_state_shapes["params"], scale_by_kron_only=False, **kron_kwargs  # pass in kwargs
 )
 ```
 
 ## Hyperparameters
 
 `learning_rate`: Kron usually likes a learning rate around 3x smaller than adam's. Kron does not share
-adam's implicit warmup, so a longer warmup schedule may be beneficial if divergence is seen very early in training.
+adam's implicit warmup, so a longer warmup schedule may be beneficial if divergence is seen early in training.
 
 **Preconditioner settings:**
 
@@ -130,12 +135,12 @@ This is the default schedule defined in the `precond_update_prob_schedule`:
 **Sharding:**
 
 If you are sharding your params, pass your params' `PartitionSpec`s into `kron` through the 
-`params_sharding` hyperparameter. This will be used for internal sharding constraints.
+`params_partition_specs` hyperparameter. This will be used for internal sharding constraints.
 
-To shard preconditioners, pass a `PartitionSpec` into the `preconditioner_sharding` hyperparameter. Best 
-practice is to set this to something like `P('fsdp', None)` or `P('fsdp', 'tp')`, sharding the first 
-preconditioner dim along a large mesh axis. If `params_sharding` is set but `preconditioner_sharding` 
-is None, a so-so preconditioner sharding strategy will be inferred from `params_sharding`.
+To shard preconditioners, pass a `PartitionSpec` into the `preconditioner_partition_spec` hyperparameter. Best 
+practice is to set this to something like `P('fsdp', None)` or `P('fsdp', 'tp')`. If `params_partition_specs`
+is set but `preconditioner_partition_spec` is None, a so-so preconditioner sharding strategy will be inferred from 
+`params_partition_specs`.
 
 **Scanned layers:**
 

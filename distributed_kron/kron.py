@@ -68,8 +68,8 @@ def scale_by_kron(
     target_merged_dim_size: int = 4096,
     partition_grads_into_blocks: bool = True,
     block_size: int = 256,
-    params_sharding: Optional[Any] = None,
-    preconditioner_sharding: Optional[PartitionSpec[str, str]] = None,
+    params_partition_specs: Optional[Any] = None,
+    preconditioner_partition_spec: Optional[PartitionSpec[str, str]] = None,
     **kwargs,
 ) -> base.GradientTransformation:
     """
@@ -112,11 +112,11 @@ def scale_by_kron(
             size `block_size` for efficiency. These blocks are stacked and vmapped over
             for faster compile and more efficient use of accelerators.
         `block_size`: int, block size to use for partitioning grads.
-        `params_sharding`: pytree same structure as params of
+        `params_partition_specs`: pytree same structure as params of
             `jax.sharding.PartitionSpec`. Used for internal sharding constraints.
-        `preconditioner_sharding`: `None` or `PartitionSpec(str | None, str | None)`,
+        `preconditioner_partition_spec`: `None` or `PartitionSpec(str | None, str | None)`,
             `PartitionSpec` to define preconditioner sharding. `None` infers a so-so
-            strategy from `params_sharding`. However, best practice is to explicitly
+            strategy from `params_partition_specs`. However, best practice is to explicitly
             set this hyperparameter to shard the first dimension across the fsdp-like
             axis. For example, `PartitionSpec('fsdp')` or `PartitionSpec('fsdp', 'tp')`.
 
@@ -129,8 +129,10 @@ def scale_by_kron(
     bs = lax_map_batch_size
 
     def init_fn(params, return_partition_specs_only=False):
-        have_params_sharding = params_sharding is not None
-        have_qs_sharding = have_params_sharding or preconditioner_sharding is not None
+        have_params_sharding = params_partition_specs is not None
+        have_qs_sharding = (
+            have_params_sharding or preconditioner_partition_spec is not None
+        )
 
         # unbox if flax style partitioned
         if have_flax:
@@ -141,30 +143,30 @@ def scale_by_kron(
             )
 
         # check that there is a PartitionSpec for every param
-        if params_sharding is not None:
-            assert len(jax.tree.leaves(params_sharding)) == len(
+        if params_partition_specs is not None:
+            assert len(jax.tree.leaves(params_partition_specs)) == len(
                 jax.tree.leaves(params)
             ), "There must be a PartitionSpec for every parameter in PSGD Kron."
-        # check that preconditioner sharding length is at least 1
-        if preconditioner_sharding is not None:
-            assert len(preconditioner_sharding) > 0, (
-                "preconditioner_sharding must have length > 0. For example, "
+        # check that preconditioner spec length is at least 1
+        if preconditioner_partition_spec is not None:
+            assert len(preconditioner_partition_spec) > 0, (
+                "preconditioner_partition_spec must have length > 0. For example, "
                 "PartitionSpec(None) or PartitionSpec('fsdp', None) are valid."
             )
 
         # extend partition specs
-        params_sharding_ = params_sharding
+        params_sharding_ = params_partition_specs
         if have_params_sharding:
             params_sharding_ = jax.tree.map(
                 lambda p, sh: PartitionSpec(*(sh + (None,) * (len(p.shape) - len(sh)))),
                 params,
                 params_sharding_,
             )
-        preconditioner_sharding_ = preconditioner_sharding
-        if preconditioner_sharding is not None:
-            if len(preconditioner_sharding) < 2:
+        preconditioner_sharding_ = preconditioner_partition_spec
+        if preconditioner_partition_spec is not None:
+            if len(preconditioner_partition_spec) < 2:
                 preconditioner_sharding_ = PartitionSpec(
-                    preconditioner_sharding[0], None
+                    preconditioner_partition_spec[0], None
                 )
 
         # reshape params shaped () to (1,) to make things simpler
@@ -357,8 +359,10 @@ def scale_by_kron(
         count_inc = safe_int32_increment(state["count"])
         key = jax.random.fold_in(jax.random.PRNGKey(42), state["count"])
 
-        have_params_sharding = params_sharding is not None
-        have_qs_sharding = have_params_sharding or preconditioner_sharding is not None
+        have_params_sharding = params_partition_specs is not None
+        have_qs_sharding = (
+            have_params_sharding or preconditioner_partition_spec is not None
+        )
 
         # unbox if flax style partitioned
         flax_partitioned = False
@@ -375,18 +379,18 @@ def scale_by_kron(
                 updates = grads_structure.unflatten(updates)
 
         # extend partition specs
-        params_sharding_ = params_sharding
+        params_sharding_ = params_partition_specs
         if have_params_sharding:
             params_sharding_ = jax.tree.map(
                 lambda g, sh: PartitionSpec(*(sh + (None,) * (len(g.shape) - len(sh)))),
                 updates,
                 params_sharding_,
             )
-        preconditioner_sharding_ = preconditioner_sharding
-        if preconditioner_sharding is not None:
-            if len(preconditioner_sharding) < 2:
+        preconditioner_sharding_ = preconditioner_partition_spec
+        if preconditioner_partition_spec is not None:
+            if len(preconditioner_partition_spec) < 2:
                 preconditioner_sharding_ = PartitionSpec(
-                    preconditioner_sharding[0], None
+                    preconditioner_partition_spec[0], None
                 )
 
         # reshape params shaped () to (1,) to make things simpler
@@ -634,9 +638,7 @@ def scale_by_kron(
 
                 # form conjB
                 conjBs = jax.tree.map(
-                    lambda g, Q, v, nm: _map_fn(
-                        lax_map, bs, nm, partial(_conjB, order=g.ndim), Q, v
-                    ),
+                    lambda g, Q, v, nm: _map_fn(lax_map, bs, nm, _conjB, Q, v, g),
                     grads_in,
                     Qs,
                     Vs,
@@ -807,8 +809,8 @@ def kron(
     target_merged_dim_size: int = 4096,
     partition_grads_into_blocks: bool = True,
     block_size: int = 256,
-    params_sharding: Optional[Any] = None,
-    preconditioner_sharding: Optional[PartitionSpec[str, str]] = None,
+    params_partition_specs: Optional[Any] = None,
+    preconditioner_partition_spec: Optional[PartitionSpec[str, str]] = None,
 ) -> base.GradientTransformation:
     """
     Implements PSGD Kron from https://github.com/lixilinx/psgd_torch.
@@ -850,11 +852,11 @@ def kron(
             size `block_size` for efficiency. These blocks are stacked and vmapped over
             for faster compile and more efficient use of accelerators.
         `block_size`: int, block size to use for partitioning grads.
-        `params_sharding`: pytree same structure as params of
+        `params_partition_specs`: pytree same structure as params of
             `jax.sharding.PartitionSpec`. Used for internal sharding constraints.
-        `preconditioner_sharding`: `None` or `PartitionSpec(str | None, str | None)`,
+        `preconditioner_partition_spec`: `None` or `PartitionSpec(str | None, str | None)`,
             `PartitionSpec` to define preconditioner sharding. `None` infers a so-so
-            strategy from `params_sharding`. However, best practice is to explicitly
+            strategy from `params_partition_specs`. However, best practice is to explicitly
             set this hyperparameter to shard the first dimension across the fsdp-like
             axis. For example, `PartitionSpec('fsdp')` or `PartitionSpec('fsdp', 'tp')`.
 
@@ -881,8 +883,8 @@ def kron(
             target_merged_dim_size=target_merged_dim_size,
             partition_grads_into_blocks=partition_grads_into_blocks,
             block_size=block_size,
-            params_sharding=params_sharding,
-            preconditioner_sharding=preconditioner_sharding,
+            params_partition_specs=params_partition_specs,
+            preconditioner_partition_spec=preconditioner_partition_spec,
         )
     ]
     if weight_decay > 0.0:
@@ -1130,8 +1132,9 @@ def _solve_triangular_right(X, A):
     return solution
 
 
-def _conjB(Q, V, order):
+def _conjB(Q, V, G):
     """Compute conjB."""
+    order = G.ndim
     p = list(range(order))
     conjB = jnp.transpose(V, p[1:] + p[:1])
     for i, q in enumerate(Q):

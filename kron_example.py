@@ -31,7 +31,7 @@ def main(
     # some inputs for kron
     params_partition_specs = jax.tree.map(lambda x: x.spec, params_sharding)  # only specs, not sharding
     scanned_layers = {"w1_scan": True, "w2": False, "b1": False}  # which arrays in model are scanned
-    preconditioner_sharding = P("fsdp", None)  # best to explicitly set preconditioner sharding
+    preconditioner_partition_spec = P("fsdp", None)  # best to explicitly set preconditioner sharding
 
     kron_kwargs = dict(
         learning_rate=0.0003,
@@ -52,8 +52,8 @@ def main(
         target_merged_dim_size=4096,
         partition_grads_into_blocks=partition_grads_into_blocks,
         block_size=512,
-        params_sharding=params_partition_specs,
-        preconditioner_sharding=preconditioner_sharding,
+        params_partition_specs=params_partition_specs,
+        preconditioner_partition_spec=preconditioner_partition_spec,
     )
 
     optimizer = kron(**kron_kwargs)
@@ -108,7 +108,7 @@ def main(
 
         """
         In the printout, you will see the preconditioners at
-        opt_state.Qs_preconditioners.w1_scan will have a sharding of
+        opt_state.Qs_preconditioners.w1_scan will have a partition spec of
         P('pipeline', None, 'fsdp', None). These dimensions correspond to the
         scanned dim from scanned_layers (0), stacked grad partitions (1), and
         the preconditioner matrix dimensions (2, 3).
