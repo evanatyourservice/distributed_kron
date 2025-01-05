@@ -5,7 +5,7 @@ build-backend = "flit_core.buildapi"
 [project]
 name = "distributed-kron"
 version = "0.1.0"
-description = "An implementation of PSGD Kron optimizer in JAX/optax for distributed training."
+description = "An implementation of PSGD Kron optimizer in JAX/optax for large scale distributed training."
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
@@ -15,6 +15,7 @@ authors = [
 keywords = [
     "python",
     "machine learning",
+    "deep learning",
     "optimization",
     "jax",
 ]
@@ -22,11 +23,12 @@ classifiers = [
     "Environment :: Console",
     "Programming Language :: Python",
     "Intended Audience :: Developers",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
     "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
     "Development Status :: 4 - Beta",
+    "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
@@ -40,3 +42,4 @@ dependencies = [
 [project.urls]
 homepage = "https://github.com/evanatyourservice/distributed_kron"
 repository = "https://github.com/evanatyourservice/distributed_kron"
+documentation = "https://github.com/evanatyourservice/distributed_kron#readme"
