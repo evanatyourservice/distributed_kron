@@ -3,11 +3,11 @@
 For original PSGD repo and some great resources, see [psgd_torch](https://github.com/lixilinx/psgd_torch).
 
 **Background**: Implementation of [PSGD Kron](https://github.com/lixilinx/psgd_torch) in JAX (optax-style) for 
-distributed training. PSGD is a second-order optimizer originally created by Xi-Lin Li that uses either 
-a hessian-based or whitening-based (gg^T) preconditioner, lie groups, and online preconditioner updating 
-to improve training convergence, generalization, and efficiency. I highly suggest taking a look at 
-Xi-Lin's PSGD repo linked above for interesting details on how PSGD works and experiments using PSGD. 
-There are also resources listed near the bottom of this readme.
+distributed training. PSGD is a second-order optimizer originally created by Xi-Lin Li and further developed by
+Omead Pooladzandi that uses either a hessian-based or whitening-based (gg^T) preconditioner, lie groups, and
+online preconditioner updating to improve training convergence, generalization, and efficiency. I highly suggest
+taking a look at Xi-Lin's PSGD repo linked above for interesting details on how PSGD works and experiments using
+PSGD. There are also resources listed near the bottom of this readme.
 
 ### `distributed_kron`:
 
@@ -16,7 +16,8 @@ preconditioners. It has less hyperparameters that need tuning than adam, and can
 drop-in replacement.
 
 Distributed kron is a version of kron meant for large scale distributed training in JAX. It uses merging of
-dimensions, vmapping of layers, partitioning of grads, and sharding constraints to allow for easy and efficient second-order training of large models.
+dimensions, vmapping of layers, partitioning of grads, and sharding constraints to allow for easy and efficient
+second-order training of large models.
 
 
 ## Installation
@@ -31,8 +32,8 @@ pip install distributed-kron
 during the first 4k steps, so training will be slightly slower at the start but will speed up 
 by around 4k steps.
 
-**Learning Rate**: Kron usually likes a learning rate around 3x smaller than adam's. Kron does not share adam's implicit warmup, 
-so a longer warmup schedule may be beneficial if divergence is seen early in training.
+**Learning Rate**: Kron usually likes a learning rate around 3x smaller than adam's. Kron does not share adam's
+implicit warmup, so a longer warmup schedule may be beneficial if divergence is seen early in training.
 
 For basic usage, use `distributed_kron.kron` like any other optax optimizer:
 
@@ -149,8 +150,8 @@ and False values indicating non-scanned arrays through the `scanned_layers` hype
 PSGD will vmap over the first dims of those layers. If you need a more advanced scanning setup, 
 please open an issue.
 
-*Scan instead of vmap*: For very large models, the preconditioner update may use too much memory all at once when scanning, 
-in which case you can set `lax_map_scanned_layers` to `True` and set `lax_map_batch_size` to a 
+*Scan instead of vmap*: For very large models, the preconditioner update may use too much memory all at once when
+scanning, in which case you can set `lax_map_scanned_layers` to `True` and set `lax_map_batch_size` to a 
 reasonable batch size for your setup (`lax.map` scans over batches of vmap, see JAX docs). If 
 your net is 32 layers and you're hitting OOM during the optimizer step, you can break the model into
 2 or 4 and set `lax_map_batch_size` to 16 or 8 respectively.
