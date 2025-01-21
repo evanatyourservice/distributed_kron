@@ -32,10 +32,11 @@ pip install distributed-kron
 during the first 4k steps, so training will be slightly slower at the start but will speed up 
 by around 4k steps.
 
-**Learning Rate**: Kron usually likes a learning rate around 3x smaller than adam's. Kron does not share adam's
-implicit warmup, so a longer warmup schedule may be beneficial if divergence is seen early in training.
+**Learning Rate**: Kron usually likes a learning rate around 3x smaller than adam's.
 
-For basic usage, use `distributed_kron.kron` like any other optax optimizer:
+**Weight Decay**: Kron may like a weight decay slightly larger than adam's (1-3x larger).
+
+For basic usage, use `distributed_kron` like any other optax optimizer:
 
 ```python
 from distributed_kron import kron
@@ -47,9 +48,9 @@ updates, opt_state = optimizer.update(grads, opt_state)
 params = optax.apply_updates(params, updates)
 ```
 
-## Advanced Usage
+## Distributed Training
 
-For advanced usage, see the `kron_example.py` file.
+See the `kron_example.py` file for a simple example.
 
 The main thing to note is that your workflow should include passing params partition specs into kron through
 `params_partition_specs`, which will be used for internal sharding constraints. Also, it is best to explicitly
@@ -57,8 +58,7 @@ set preconditioner partition specs using `preconditioner_partition_spec` (see hy
 
 #### `get_opt_state_partition_specs`:
 
-If you need it, there is an optimizer state partition specs helper function
-`get_opt_state_partition_specs`:
+This is a helper function to get the optimizer state partition specs from the params.
 
 ```python
 from distributed_kron import get_opt_state_partition_specs
@@ -78,15 +78,18 @@ opt_state_partition_specs = get_opt_state_partition_specs(
 )
 ```
 
-## Hyperparameters
+## Hyperparameter Descriptions
 
-`learning_rate`: Kron usually likes a learning rate around 3x smaller than adam's. Kron does not share
-adam's implicit warmup, so a longer warmup schedule may be beneficial if divergence is seen early in training.
+`learning_rate`: Kron usually likes a learning rate around 3x smaller than adam's.
 
-**Preconditioner settings:**
+`weight_decay`: Kron may like a weight decay slightly larger than adam's (1-3x larger).
+
+Kron does not have epsilon or beta2.
+
+**Preconditioner Info:**
 
 *Preconditioner structure*: For a layer with shape (256, 128), default triangular preconditioners would be shapes
-(256, 256) and (128, 128). However, with the following options we can also choose to make some of all of these
+(256, 256) and (128, 128). However, with the following options we can also choose to make some or all of these
 preconditioners diagonal, which would be shapes (256,) and (128,).
 
 Depending on how the following settings are chosen, `kron` can balance between memory/speed and effectiveness.
