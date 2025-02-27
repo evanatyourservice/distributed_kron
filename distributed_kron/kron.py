@@ -1420,6 +1420,7 @@ def _unstack_and_unpad_matrices(stacked_array, original_shapes):
 
 
 # unused fns (can be used for stacking partitions without padding):
+# TODO add back in with option to allow partitioning without padding for speed
 def _sort_and_group_matrices(matrix_shapes: List[Tuple[int, ...]]):
     indexed_list = list(enumerate(matrix_shapes))
     sorted_indexed = sorted(indexed_list, key=lambda x: x[1])
