@@ -34,7 +34,7 @@ by around 4k steps.
 
 **Learning Rate**: Kron usually likes a learning rate around 3x smaller than adam's.
 
-**Weight Decay**: Kron may like a weight decay slightly larger than adam's (1-3x larger).
+**Weight Decay**: Kron usually likes a weight decay larger than adam's (3-10x larger).
 
 For basic usage, use `distributed_kron` like any other optax optimizer:
 
