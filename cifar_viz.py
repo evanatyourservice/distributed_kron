@@ -9,7 +9,7 @@ import optax
 from datasets import load_dataset
 from distributed_kron import kron
 
-jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+jax.config.update("jax_default_matmul_precision", "float32")
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
@@ -144,19 +144,12 @@ class VisionTransformer(nn.Module):
 
 def create_train_state(rng, model, learning_rate, weight_decay, total_steps):
     params = model.init(rng, jnp.ones((2, 32, 32, 3)))
-    warmup_steps = 500
-    lr_schedule = optax.join_schedules(
-        schedules=[
-            optax.linear_schedule(0.0, learning_rate, warmup_steps),
-            optax.linear_schedule(learning_rate, 0.0, total_steps - warmup_steps)
-        ],
-        boundaries=[warmup_steps]
-    )
+    lr_schedule = optax.linear_schedule(learning_rate, 1e-8, total_steps)
     optimizer = kron(
         learning_rate=lr_schedule, weight_decay=weight_decay,
         merge_small_dims=False, partition_grads_into_blocks=False,
         preconditioner_update_probability=1.0,  # run every step for better visualization
-        preconditioner_lr=0.5,
+        preconditioner_lr=1.0,
     )
     return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
 
@@ -279,11 +272,11 @@ def visualize_kron_optimizer(state, epoch, save_dir="assets"):
     display_name = "Block 2 - Attention Query"
     
     fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-    fig.suptitle(f"Kronecker Optimizer Visualization - {display_name} (Epoch {epoch})", fontsize=16)
+    fig.suptitle(f"Gradient Whitening with PSGD Kron - {display_name}", fontsize=16)
     
     titles = [
         ["Gradient", "Gradient Gram", "Left Q", "Right Q"],
-        ["Whitened Gradient", "Whitened Gram", "Left Preconditioner", "Right Preconditioner"]
+        ["Whitened Gradient", "Whitened Gradient Gram", "Left Preconditioner", "Right Preconditioner"]
     ]
     
     for row in range(2):
@@ -319,6 +312,8 @@ def visualize_kron_optimizer(state, epoch, save_dir="assets"):
         [grad, grad_gram, left_q, right_q],
         [whitened_grad, whitened_gram, left_p, right_p]
     ]
+
+    cmap = 'hot'
     
     for row in range(2):
         for col in range(4):
@@ -328,7 +323,7 @@ def visualize_kron_optimizer(state, epoch, save_dir="assets"):
                 vmin, vmax = -np.abs(matrix).max(), np.abs(matrix).max()
             im = axes[row, col].imshow(
                 np.array(matrix),
-                cmap='hot', vmin=vmin, vmax=vmax, aspect='equal'
+                cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal'
             )
             plt.colorbar(im, ax=axes[row, col])
             axes[row, col].set_xticks([])
@@ -336,6 +331,38 @@ def visualize_kron_optimizer(state, epoch, save_dir="assets"):
     
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig(os.path.join(save_dir, f"kron_visualization_epoch_{epoch}.png"), dpi=300)
+    plt.close()
+    
+    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+    fig.suptitle(f"Gradient Orthogonalization with SVD - {display_name}", fontsize=16)
+    
+    u, _, vh = jnp.linalg.svd(grad, full_matrices=False)
+    whitened_grad_svd = jnp.matmul(u, vh)
+    whitened_gram_svd = jnp.matmul(whitened_grad_svd, whitened_grad_svd.T)
+
+    titles = [["Original Gradient", "Original Gradient Gram"], 
+              ["Orthogonalized Gradient", "Orthogonalized Gradient Gram"]]
+    
+    matrices = [[grad, grad_gram], 
+                [whitened_grad_svd, whitened_gram_svd]]
+    
+    for row in range(2):
+        for col in range(2):
+            matrix = matrices[row][col]
+            vmin, vmax = None, None
+            if col == 0 or row == 0:
+                vmin, vmax = -np.abs(matrix).max(), np.abs(matrix).max()
+            im = axes[row, col].imshow(
+                np.array(matrix),
+                cmap=cmap, vmin=vmin, vmax=vmax, aspect='equal'
+            )
+            plt.colorbar(im, ax=axes[row, col])
+            axes[row, col].set_title(titles[row][col])
+            axes[row, col].set_xticks([])
+            axes[row, col].set_yticks([])
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(os.path.join(save_dir, f"ortho_visualization_epoch_{epoch}.png"), dpi=300)
     plt.close()
 
 
@@ -381,7 +408,7 @@ def train_model(model_config, train_config):
         print(f"  Epoch {epoch+1} Evaluation - Loss: {avg_eval_loss:.4f}, "
               f"Accuracy: {avg_eval_accuracy:.4f}")
         
-        if epoch + 1 == train_config["num_epochs"] - 1:
+        if epoch + 1 == train_config["num_epochs"]:
             visualize_kron_optimizer(state, epoch + 1)
     
     return state
@@ -394,8 +421,8 @@ if __name__ == "__main__":
     }
     
     train_config = {
-        "batch_size": 128, "learning_rate": 0.005, "weight_decay": 1.0,
-        "num_epochs": 2, "seed": 42, "print_every": 50,
+        "batch_size": 128, "learning_rate": 0.003, "weight_decay": 0.7,
+        "num_epochs": 4, "seed": 42, "print_every": 50,
     }
     
     train_model(model_config, train_config)
