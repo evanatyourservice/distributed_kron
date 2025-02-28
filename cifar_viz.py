@@ -1,13 +1,19 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from flax.training import train_state
+import optax
 from datasets import load_dataset
-import numpy as np
-from tqdm import tqdm
-
 from distributed_kron import kron
 
+jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
 
 init_fn = lambda dim: nn.initializers.normal(jnp.sqrt(2 / (5 * dim)))
 wang_fn = lambda dim, n_layers: nn.initializers.normal(2 / n_layers / jnp.sqrt(dim))
@@ -19,8 +25,7 @@ class RMSNorm(nn.Module):
     @nn.compact
     def __call__(self, x):
         var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=self.reduction_axes, keepdims=True)
-        normed_inputs = x * jax.lax.rsqrt(var + 1e-06)
-        return normed_inputs.astype(x.dtype)
+        return (x * jax.lax.rsqrt(var + 1e-06)).astype(x.dtype)
 
 
 def _dot_product_attention_core(query, key, value):
@@ -28,41 +33,33 @@ def _dot_product_attention_core(query, key, value):
     query *= jax.lax.rsqrt(jnp.array(head_dim, dtype=jnp.float32)).astype(query.dtype)
     logits = jnp.einsum("BTNH,BSNH->BNTS", query, key)
     probs = jax.nn.softmax(logits.astype(jnp.float32)).astype(logits.dtype)
-    encoded = jnp.einsum("BNTS,BSNH->BTNH", probs, value)
-    return encoded
+    return jnp.einsum("BNTS,BSNH->BTNH", probs, value)
 
 
 def _sine_table(features, length, min_timescale=1.0, max_timescale=10000.0):
     fraction = jnp.arange(0, features, 2, dtype=jnp.float32) / features
     timescale = min_timescale * (max_timescale / min_timescale) ** fraction
-    rotational_frequency = 1.0 / timescale
-    sinusoid_inp = jnp.einsum(
-        "i,j->ij",
-        jnp.arange(length),
-        rotational_frequency,
-        precision=jax.lax.Precision.HIGHEST,
-    )
+    sinusoid_inp = jnp.einsum("i,j->ij", jnp.arange(length), 1.0 / timescale, 
+                             precision=jax.lax.Precision.HIGHEST)
     sinusoid_inp = jnp.concatenate([sinusoid_inp, sinusoid_inp], axis=-1)
     return jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)
 
 
 def _rotate_half(x):
     x1, x2 = jnp.split(x, 2, axis=-1)
-    x = jnp.concatenate([-x2, x1], axis=-1)
-    return x
+    return jnp.concatenate([-x2, x1], axis=-1)
 
 
 def _apply_rotary_embedding(q, k, cos, sin):
-    qlen = q.shape[-4]
-    klen = k.shape[-3]
+    qlen, klen = q.shape[-4], k.shape[-3]
     qcos = jnp.expand_dims(cos[:qlen, :], range(len(q.shape) - 2))
     qsin = jnp.expand_dims(sin[:qlen, :], range(len(q.shape) - 2))
     kcos = jnp.expand_dims(cos[:klen, :], range(len(k.shape) - 2))
     ksin = jnp.expand_dims(sin[:klen, :], range(len(k.shape) - 2))
-    qcos = jnp.swapaxes(qcos, -2, -4)
-    qsin = jnp.swapaxes(qsin, -2, -4)
-    kcos = jnp.swapaxes(kcos, -2, -3)
-    ksin = jnp.swapaxes(ksin, -2, -3)
+    
+    qcos, qsin = jnp.swapaxes(qcos, -2, -4), jnp.swapaxes(qsin, -2, -4)
+    kcos, ksin = jnp.swapaxes(kcos, -2, -3), jnp.swapaxes(ksin, -2, -3)
+    
     out_q = q * qcos + _rotate_half(q) * qsin
     out_k = k * kcos + _rotate_half(k) * ksin
     return out_q.astype(q.dtype), out_k.astype(k.dtype)
@@ -76,37 +73,24 @@ class Attention(nn.Module):
     @nn.compact
     def __call__(self, x):
         B, T, C = x.shape
-        N = self.num_heads
-        K = self.num_kv_heads
-        G = N // K
-        H = C // N
+        N, K = self.num_heads, self.num_kv_heads
+        G, H = N // K, C // N
 
         q_params = self.param("q_kernel", init_fn(C), (C, N * H))
         k_params = self.param("k_kernel", init_fn(C), (C, K * H))
         v_params = self.param("v_kernel", init_fn(C), (C, K * H))
         out_params = self.param("out_kernel", wang_fn(N * H, self.n_layers), (N * H, C))
 
-        q = jnp.dot(x, q_params)
-        k = jnp.dot(x, k_params)
-        v = jnp.dot(x, v_params)
-
-        q = RMSNorm()(q)
-        k = RMSNorm()(k)
-
+        q, k, v = jnp.dot(x, q_params), jnp.dot(x, k_params), jnp.dot(x, v_params)
+        q, k = RMSNorm()(q), RMSNorm()(k)
         q = jnp.reshape(q, (B, T, K, G, H))
-        k = jnp.reshape(k, (B, T, K, H))
-        v = jnp.reshape(v, (B, T, K, H))
+        k, v = jnp.reshape(k, (B, T, K, H)), jnp.reshape(v, (B, T, K, H))
 
         sin, cos = _sine_table(H, T, max_timescale=10000.0)
         q, k = _apply_rotary_embedding(q, k, cos, sin)
 
-        vmapped_fn = jax.vmap(
-            _dot_product_attention_core, in_axes=(3, None, None), out_axes=3
-        )
-        encoded = vmapped_fn(q, k, v)
-        encoded = jnp.reshape(encoded, (B, T, N * H))
-        out = jnp.dot(encoded, out_params)
-        return out
+        encoded = jax.vmap(_dot_product_attention_core, in_axes=(3, None, None), out_axes=3)(q, k, v)
+        return jnp.dot(jnp.reshape(encoded, (B, T, N * H)), out_params)
 
 
 class MLP(nn.Module):
@@ -118,9 +102,7 @@ class MLP(nn.Module):
         hid = C * 2
         up_kernel = self.param("up_kernel", init_fn(C), (C, hid))
         down_kernel = self.param("down_kernel", wang_fn(hid, self.n_layers), (hid, C))
-        x = jnp.dot(x, up_kernel)
-        x = nn.silu(x)
-        return jnp.dot(x, down_kernel)
+        return jnp.dot(nn.silu(jnp.dot(x, up_kernel)), down_kernel)
 
 
 class Block(nn.Module):
@@ -130,12 +112,7 @@ class Block(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        attn_layer = Attention(
-            self.num_heads,
-            self.num_kv_heads,
-            self.n_layers,
-        )
-        x += attn_layer(RMSNorm()(x))
+        x += Attention(self.num_heads, self.num_kv_heads, self.n_layers)(RMSNorm()(x))
         x += MLP(self.n_layers)(RMSNorm()(x))
         return x
 
@@ -146,65 +123,47 @@ class VisionTransformer(nn.Module):
     num_kv_heads: int
     num_layers: int
     num_classes: int
-    patch_size: int = 4  # Changed to 4 for CIFAR-10 (32x32 images)
+    patch_size: int = 4
 
     @nn.compact
     def __call__(self, x, train: bool = True):
         B, H, W, C = x.shape
-        
-        # Patch embedding
         x = nn.Conv(self.embed_dim, kernel_size=(self.patch_size, self.patch_size), 
                    strides=(self.patch_size, self.patch_size))(x)
-        
-        # Reshape to sequence
         x = jnp.reshape(x, (B, -1, self.embed_dim))
         
-        # Add positional embedding
-        pos_embedding = self.param("pos_embedding", 
-                                  nn.initializers.normal(0.02), 
+        pos_embedding = self.param("pos_embedding", nn.initializers.normal(0.02), 
                                   (1, x.shape[1], self.embed_dim))
         x = x + pos_embedding
         
-        # Transformer blocks
-        for i in range(self.num_layers):
-            x = Block(
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                n_layers=self.num_layers,
-            )(x)
+        for _ in range(self.num_layers):
+            x = Block(self.num_heads, self.num_kv_heads, self.num_layers)(x)
         
-        # Global average pooling
-        x = jnp.mean(x, axis=1)
-        
-        # Layer norm before classifier
-        x = RMSNorm()(x)
-        
-        # Classifier
-        x = nn.Dense(self.num_classes)(x)
-        
-        return x
+        return nn.Dense(self.num_classes)(RMSNorm()(jnp.mean(x, axis=1)))
 
 
-def create_train_state(rng, model, learning_rate, weight_decay):
-    dummy_input = jnp.ones((2, 32, 32, 3))
-    params = model.init(rng, dummy_input)
-    
+def create_train_state(rng, model, learning_rate, weight_decay, total_steps):
+    params = model.init(rng, jnp.ones((2, 32, 32, 3)))
+    warmup_steps = 500
+    lr_schedule = optax.join_schedules(
+        schedules=[
+            optax.linear_schedule(0.0, learning_rate, warmup_steps),
+            optax.linear_schedule(learning_rate, 0.0, total_steps - warmup_steps)
+        ],
+        boundaries=[warmup_steps]
+    )
     optimizer = kron(
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
+        learning_rate=lr_schedule, weight_decay=weight_decay,
+        merge_small_dims=False, partition_grads_into_blocks=False,
+        preconditioner_update_probability=1.0,  # run every step for better visualization
+        preconditioner_lr=0.5,
     )
-    
-    return train_state.TrainState.create(
-        apply_fn=model.apply,
-        params=params,
-        tx=optimizer,
-    )
+    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optimizer)
 
 
 def cross_entropy_loss(logits, labels):
     one_hot_labels = jax.nn.one_hot(labels, num_classes=logits.shape[-1])
-    loss = -jnp.sum(one_hot_labels * jax.nn.log_softmax(logits), axis=-1)
-    return jnp.mean(loss)
+    return jnp.mean(-jnp.sum(one_hot_labels * jax.nn.log_softmax(logits), axis=-1))
 
 
 @jax.jit
@@ -213,14 +172,10 @@ def train_step(state, batch):
     
     def loss_fn(params):
         logits = state.apply_fn(params, images)
-        loss = cross_entropy_loss(logits, labels)
-        return loss, logits
+        return cross_entropy_loss(logits, labels), logits
     
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, logits), grads = grad_fn(state.params)
-    
+    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
-    
     accuracy = jnp.mean(jnp.argmax(logits, axis=-1) == labels)
     
     return state, loss, accuracy
@@ -235,127 +190,175 @@ def eval_step(state, batch):
     return loss, accuracy
 
 
-def random_crop(image, padding=4):
-    """Randomly crop the image with padding."""
-    height, width = image.shape[:2]
-    padded = np.pad(image, ((padding, padding), (padding, padding), (0, 0)), mode='reflect')
+def random_crop(images, padding=4):
+    batch_size, height, width, channels = images.shape
+    padded = np.pad(images, ((0, 0), (padding, padding), (padding, padding), (0, 0)), mode='reflect')
+    h_starts = np.random.randint(0, 2 * padding + 1, size=batch_size)
+    w_starts = np.random.randint(0, 2 * padding + 1, size=batch_size)
     
-    # Random crop coordinates
-    h_start = np.random.randint(0, 2 * padding + 1)
-    w_start = np.random.randint(0, 2 * padding + 1)
+    cropped_images = np.zeros_like(images)
+    for i, (h_start, w_start) in enumerate(zip(h_starts, w_starts)):
+        cropped_images[i] = padded[i, h_start:h_start+height, w_start:w_start+width, :]
     
-    return padded[h_start:h_start+height, w_start:w_start+width, :]
+    return cropped_images
 
 
-def random_flip(image):
-    """Randomly flip the image horizontally."""
-    if np.random.random() < 0.5:
-        return image[:, ::-1, :]
-    return image
+def random_flip(images):
+    flip_mask = np.random.random(size=images.shape[0]) < 0.5
+    flipped_images = images.copy()
+    flipped_images[flip_mask] = flipped_images[flip_mask, :, ::-1, :]
+    return flipped_images
 
 
-def color_jitter(image, brightness=0.1, contrast=0.1, saturation=0.1):
-    """Apply random color jittering to the image."""
-    # Brightness adjustment
-    if np.random.random() < 0.5:
-        factor = 1.0 + np.random.uniform(-brightness, brightness)
-        image = np.clip(image * factor, 0, 1)
+def color_jitter(images, brightness=0.1, contrast=0.1, saturation=0.1):
+    batch_size = images.shape[0]
+    jittered_images = images.copy()
     
-    # Contrast adjustment
-    if np.random.random() < 0.5:
-        factor = 1.0 + np.random.uniform(-contrast, contrast)
-        mean = np.mean(image, axis=(0, 1), keepdims=True)
-        image = np.clip((image - mean) * factor + mean, 0, 1)
+    brightness_factors = np.random.uniform(1-brightness, 1+brightness, size=batch_size)
+    brightness_mask = np.random.random(size=batch_size) < 0.5
+    for i, (factor, apply) in enumerate(zip(brightness_factors, brightness_mask)):
+        if apply:
+            jittered_images[i] = np.clip(jittered_images[i] * factor, 0, 1)
     
-    # Simple saturation adjustment (approximation)
-    if np.random.random() < 0.5:
-        factor = 1.0 + np.random.uniform(-saturation, saturation)
-        gray = np.mean(image, axis=2, keepdims=True)
-        image = np.clip(gray + factor * (image - gray), 0, 1)
+    contrast_factors = np.random.uniform(1-contrast, 1+contrast, size=batch_size)
+    contrast_mask = np.random.random(size=batch_size) < 0.5
+    for i, (factor, apply) in enumerate(zip(contrast_factors, contrast_mask)):
+        if apply:
+            mean = np.mean(jittered_images[i], axis=(0, 1), keepdims=True)
+            jittered_images[i] = np.clip((jittered_images[i] - mean) * factor + mean, 0, 1)
     
-    return image
+    saturation_factors = np.random.uniform(1-saturation, 1+saturation, size=batch_size)
+    saturation_mask = np.random.random(size=batch_size) < 0.5
+    for i, (factor, apply) in enumerate(zip(saturation_factors, saturation_mask)):
+        if apply:
+            gray = np.mean(jittered_images[i], axis=2, keepdims=True)
+            jittered_images[i] = np.clip(gray + factor * (jittered_images[i] - gray), 0, 1)
+    
+    return jittered_images
+
+
+def normalize_images(images):
+    mean = np.array([0.4914, 0.4822, 0.4465]).reshape(1, 1, 1, 3)
+    std = np.array([0.2470, 0.2435, 0.2616]).reshape(1, 1, 1, 3)
+    return (images - mean) / std
 
 
 def prepare_data(batch_size=128):
-    """Prepare CIFAR-10 data for training and evaluation."""
-    print("Loading CIFAR-10 dataset...")
     dataset = load_dataset("cifar10")
-    
-    # Convert to numpy format
     train_dataset = dataset["train"].with_format("numpy")
     test_dataset = dataset["test"].with_format("numpy")
     
-    # Pre-process all images once to avoid repeated processing
-    print("Pre-processing training data...")
     train_images = np.array(train_dataset["img"], dtype=np.float32) / 255.0
     train_labels = np.array(train_dataset["label"], dtype=np.int32)
-    
-    print("Pre-processing test data...")
     test_images = np.array(test_dataset["img"], dtype=np.float32) / 255.0
     test_labels = np.array(test_dataset["label"], dtype=np.int32)
     
-    # Create data generators
     def train_generator():
-        num_samples = len(train_images)
-        indices = np.random.permutation(num_samples)
-        
-        for start_idx in range(0, num_samples, batch_size):
-            end_idx = min(start_idx + batch_size, num_samples)
+        indices = np.random.permutation(len(train_images))
+        for start_idx in range(0, len(train_images), batch_size):
+            end_idx = min(start_idx + batch_size, len(train_images))
             batch_indices = indices[start_idx:end_idx]
-            
-            # Apply data augmentation
-            batch_images = []
-            for idx in batch_indices:
-                img = train_images[idx].copy()
-                img = random_crop(img)
-                img = random_flip(img)
-                img = color_jitter(img)
-                batch_images.append(img)
-            
-            batch_images = np.stack(batch_images)
-            batch_labels = train_labels[batch_indices]
-            
-            yield batch_images, batch_labels
+            batch_images = train_images[batch_indices].copy()
+            yield normalize_images(color_jitter(random_flip(random_crop(batch_images)))), train_labels[batch_indices]
     
     def test_generator():
-        num_samples = len(test_images)
-        
-        for start_idx in range(0, num_samples, batch_size):
-            end_idx = min(start_idx + batch_size, num_samples)
-            batch_images = test_images[start_idx:end_idx]
-            batch_labels = test_labels[start_idx:end_idx]
-            
-            yield batch_images, batch_labels
+        for start_idx in range(0, len(test_images), batch_size):
+            end_idx = min(start_idx + batch_size, len(test_images))
+            yield normalize_images(test_images[start_idx:end_idx].copy()), test_labels[start_idx:end_idx]
     
     return train_generator, test_generator
 
 
+def visualize_kron_optimizer(state, epoch, save_dir="assets"):
+    os.makedirs(save_dir, exist_ok=True)
+    
+    optimizer_state = state.opt_state
+    params = state.params
+    
+    param_path = ["params", "Block_2", "Attention_0", "q_kernel"]
+    display_name = "Block 2 - Attention Query"
+    
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    fig.suptitle(f"Kronecker Optimizer Visualization - {display_name} (Epoch {epoch})", fontsize=16)
+    
+    titles = [
+        ["Gradient", "Gradient Gram", "Left Q", "Right Q"],
+        ["Whitened Gradient", "Whitened Gram", "Left Preconditioner", "Right Preconditioner"]
+    ]
+    
+    for row in range(2):
+        for col, title in enumerate(titles[row]):
+            axes[row, col].set_title(title)
+    
+    preconditioners = optimizer_state[0].get('Qs_preconditioners', {})
+    all_grads = optimizer_state[0].get('mu', {})
+    
+    param = params
+    for k in param_path:
+        param = param[k]
+    
+    grad = all_grads
+    for k in param_path:
+        grad = grad[k]
+    
+    current_precond = preconditioners
+    for k in param_path[:-1]:
+        if k in current_precond:
+            current_precond = current_precond[k]
+    
+    precond_factors = current_precond[param_path[-1]]
+    left_q, right_q = precond_factors[0], precond_factors[1]
+    
+    grad_gram = jnp.matmul(grad, grad.T)
+    left_p = jnp.matmul(left_q.T, left_q)
+    right_p = jnp.matmul(right_q.T, right_q)
+    whitened_grad = jnp.matmul(jnp.matmul(left_p, grad), right_p.T)
+    whitened_gram = jnp.matmul(whitened_grad, whitened_grad.T)
+    
+    matrices = [
+        [grad, grad_gram, left_q, right_q],
+        [whitened_grad, whitened_gram, left_p, right_p]
+    ]
+    
+    for row in range(2):
+        for col in range(4):
+            matrix = matrices[row][col]
+            vmin, vmax = None, None
+            if col == 0:
+                vmin, vmax = -np.abs(matrix).max(), np.abs(matrix).max()
+            im = axes[row, col].imshow(
+                np.array(matrix),
+                cmap='hot', vmin=vmin, vmax=vmax, aspect='equal'
+            )
+            plt.colorbar(im, ax=axes[row, col])
+            axes[row, col].set_xticks([])
+            axes[row, col].set_yticks([])
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(os.path.join(save_dir, f"kron_visualization_epoch_{epoch}.png"), dpi=300)
+    plt.close()
+
+
 def train_model(model_config, train_config):
-    """Train the Vision Transformer model on CIFAR-10."""
-    print("Initializing model...")
     rng = jax.random.PRNGKey(train_config["seed"])
     rng, init_rng = jax.random.split(rng)
-    
     model = VisionTransformer(**model_config)
-    state = create_train_state(
-        init_rng, 
-        model, 
-        learning_rate=train_config["learning_rate"],
-        weight_decay=train_config["weight_decay"]
-    )
     
     train_generator, test_generator = prepare_data(train_config["batch_size"])
+    total_steps = train_config["num_epochs"] * 50000 // train_config["batch_size"]
     
+    state = create_train_state(
+        init_rng, model, train_config["learning_rate"],
+        train_config["weight_decay"], total_steps
+    )
+
     print_every = train_config.get("print_every", 50)
     step = 0
     
     for epoch in range(train_config["num_epochs"]):
         print(f"Epoch {epoch+1}/{train_config['num_epochs']}")
         
-        # Training
-        train_losses = []
-        train_accuracies = []
-        
+        train_losses, train_accuracies = [], []
         for batch in train_generator():
             state, loss, accuracy = train_step(state, batch)
             train_losses.append(loss)
@@ -367,10 +370,7 @@ def train_model(model_config, train_config):
                 avg_acc = np.mean(train_accuracies[-print_every:])
                 print(f"  Step {step}: Train Loss: {avg_loss:.4f}, Train Accuracy: {avg_acc:.4f}")
         
-        # Evaluation
-        eval_losses = []
-        eval_accuracies = []
-        
+        eval_losses, eval_accuracies = [], []
         for batch in test_generator():
             loss, accuracy = eval_step(state, batch)
             eval_losses.append(loss)
@@ -378,29 +378,24 @@ def train_model(model_config, train_config):
         
         avg_eval_loss = float(np.mean(eval_losses))
         avg_eval_accuracy = float(np.mean(eval_accuracies))
+        print(f"  Epoch {epoch+1} Evaluation - Loss: {avg_eval_loss:.4f}, "
+              f"Accuracy: {avg_eval_accuracy:.4f}")
         
-        print(f"  Epoch {epoch+1} Evaluation - Loss: {avg_eval_loss:.4f}, Accuracy: {avg_eval_accuracy:.4f}")
+        if epoch + 1 == train_config["num_epochs"] - 1:
+            visualize_kron_optimizer(state, epoch + 1)
     
     return state
 
 
 if __name__ == "__main__":
     model_config = {
-        "embed_dim": 192,
-        "num_heads": 6,
-        "num_kv_heads": 3,
-        "num_layers": 6,
-        "num_classes": 10,
-        "patch_size": 4,  # Use smaller patches for CIFAR-10
+        "embed_dim": 192, "num_heads": 6, "num_kv_heads": 3,
+        "num_layers": 6, "num_classes": 10, "patch_size": 4,
     }
     
     train_config = {
-        "batch_size": 128,
-        "learning_rate": 0.0001,  # Adjusted learning rate
-        "weight_decay": 0.1,      # Adjusted weight decay
-        "num_epochs": 10,
-        "seed": 42,
-        "print_every": 50,
+        "batch_size": 128, "learning_rate": 0.005, "weight_decay": 1.0,
+        "num_epochs": 2, "seed": 42, "print_every": 50,
     }
     
     train_model(model_config, train_config)
