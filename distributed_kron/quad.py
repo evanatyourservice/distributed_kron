@@ -31,6 +31,7 @@ PartitionSpecTree = TypeVar(
 
 def scale_by_quad(
     b1: float = 0.95,
+    normalize_grads: bool = False,
     max_size_dense: int = 8192,
     max_skew_dense: float = 1.0,
     preconditioner_lr: float = 0.7,
@@ -228,18 +229,19 @@ def scale_by_quad(
             Qs_sharding = jax.tree.map(add_dims_to_spec, params, Qs_sharding_no_leading_dims, scanned_dim_sharding)
 
         if not return_partition_specs_only:
-            # broadcast Qs for stacks and scans
-            def broadcast_qs(_, ps, q, s):
+            # broadcast Qs and Ls for stacks and scans
+            def broadcast_qs(_, ps, x, s):
                 stack_n = ps[0]
                 if partition_grads_into_blocks:
                     # add leading dim for stacked partitions
-                    q = jax.tree.map(lambda x: jnp.repeat(jnp.expand_dims(x, 0), stack_n, axis=0), q)
+                    x = jax.tree.map(lambda x: jnp.repeat(jnp.expand_dims(x, 0), stack_n, axis=0), x)
                 if s > 0:
                     # add leading dim if we're scanning this layer
-                    q = jax.tree.map(lambda d: jnp.repeat(jnp.expand_dims(d, 0), s, axis=0), q)
-                return q
+                    x = jax.tree.map(lambda d: jnp.repeat(jnp.expand_dims(d, 0), s, axis=0), x)
+                return x
 
             Qs = jax.tree.map(broadcast_qs, params, partitioned_shapes, Qs, scanned_sizes)
+            Ls = jax.tree.map(broadcast_qs, params, partitioned_shapes, Ls, scanned_sizes)
             if have_qs_sharding:
                 Qs = _safe_sharding_constraint(Qs, Qs_sharding)
 
@@ -264,8 +266,7 @@ def scale_by_quad(
         precond_lr_t = get_precond_lr(preconditioner_lr, count_inc)
 
         have_params_sharding = params_partition_specs is not None
-        if have_params_sharding:
-            original_params_sharding_ = params_sharding_
+        original_params_sharding_ = None
         have_qs_sharding = have_params_sharding or preconditioner_partition_spec is not None
 
         # unbox if flax style partitioned
@@ -285,6 +286,8 @@ def scale_by_quad(
             params_sharding_ = jax.tree.map(
                 lambda g, sh: PartitionSpec(*(sh + (None,) * (len(g.shape) - len(sh)))), updates, params_sharding_
             )
+            # save a copy of the original params sharding for final constraint
+            original_params_sharding_ = params_sharding_
         preconditioner_sharding_ = preconditioner_partition_spec
         if preconditioner_partition_spec is not None:
             if len(preconditioner_partition_spec) < 2:
@@ -302,6 +305,10 @@ def scale_by_quad(
         scanned_layers_ = scanned_layers
         if scanned_layers is None:
             scanned_layers_ = jax.tree.map(lambda _: False, updates)
+
+        # optionally normalize grads layer-wise
+        if normalize_grads:
+            updates = jax.tree.map(lambda g: g / (jnp.linalg.norm(g) + 1e-6), updates)
 
         # momentum
         mu = None
@@ -481,21 +488,20 @@ def scale_by_quad(
             Qs = _safe_sharding_constraint(Qs, Qs_sharding)
 
         # update Qs
-        key = jax.random.fold_in(key, count_inc)
-        keys = list(jax.random.split(key, len(jax.tree.leaves(momentum_updates))))
-        keys = jax.tree.map(
-            lambda k, g, s: jax.random.split(
-                k,
-                (
-                    jnp.reshape(jax.random.split(k, np.prod(g.shape[int(s):])), g.shape[:int(s)] + (-1,))
-                    if s > 0
-                    else k
-                ),
-            ),
-            keys,
-            momentum_updates,
-            scanned_layers_,
-        )
+        key = jax.random.fold_in(jax.random.PRNGKey(42), state["count"])
+        flat_updates, updates_struct = jax.tree.flatten(momentum_updates)
+        flat_leaf_keys = jax.random.split(key, len(flat_updates))
+        leaf_keys_tree = updates_struct.unflatten(list(flat_leaf_keys))
+        # create per-leaf stacked keys matching mapped leading dims
+        def make_keys(k, g, nm):
+            nm = int(nm)
+            if nm <= 0:
+                return k
+            num = int(np.prod(g.shape[:nm]))
+            ks = jax.random.split(k, num)
+            return jnp.reshape(ks, g.shape[:nm] + (2,))
+
+        keys = jax.tree.map(make_keys, leaf_keys_tree, momentum_updates, n_dims_to_map)
         Qs_Ls_Pg = jax.tree.map(
             lambda g, Q, L, expr, nm, qss, sh, k: _map_fn(
                 lax_map,
@@ -600,6 +606,7 @@ def quad(
     b1: float = 0.95,
     weight_decay: float = 0.5,
     weight_decay_mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None,
+    normalize_grads: bool = False,
     max_size_dense: int = 8192,
     max_skew_dense: float = 1.0,
     preconditioner_lr: float = 0.7,
@@ -663,6 +670,7 @@ def quad(
     optimizer = [
         scale_by_quad(
             b1=b1,
+            normalize_grads=normalize_grads,
             max_size_dense=max_size_dense,
             max_skew_dense=max_skew_dense,
             preconditioner_lr=preconditioner_lr,
@@ -818,7 +826,7 @@ def _init_Q_exprs(
 
 
 def get_precond_lr(base_lr: float, step: jax.Array):
-    return jnp.maximum(base_lr * jax.lax.rsqrt(1.0 + step / 10000.0), 0.1)
+    return jnp.maximum(base_lr * jax.lax.rsqrt(1.0 + step / 10000.0), 0.2)
 
 
 def _norm_lower_bound(A: jax.Array):
@@ -840,7 +848,7 @@ def _update_precond(Q, L, G, key, exprs, precond_lr, qs_sharding, params_shardin
     """Update Q using QUAD method and return preconditioned gradient."""
     exprP, exprGs = exprs
 
-    Pg = jnp.einsum(exprP, *Q, *Q, G + jax.random.normal(key, G.shape, G.dtype) * 1e-9)
+    Pg = jnp.einsum(exprP, *Q, *Q, G + jax.random.normal(key, G.shape, G.dtype) * 1e-8)
     
     total_numel = G.size
     betaL = 0.95
@@ -860,12 +868,12 @@ def _update_precond(Q, L, G, key, exprs, precond_lr, qs_sharding, params_shardin
             l_new = jnp.maximum(betaL * l + (1 - betaL) * ell, ell)
             lr_over_2l = (precond_lr / (2 * l_new)).astype(q.dtype)
             # original
-            # p = q - lr_over_2l * (term1 @ q - term2 * q)
-            # p = p - lr_over_2l * (p @ term1 - p * term2)
+            p = q - lr_over_2l * (term1 @ q - term2 * q)
+            p = p - lr_over_2l * (p @ term1 - p * term2)
             # multiplicative
-            scale1 = 1 + lr_over_2l * term2
-            p = scale1 * Q - lr_over_2l * (term1 @ Q)
-            p = scale1 * p - lr_over_2l * (p @ term1)
+            # scale1 = 1 + lr_over_2l * term2
+            # p = scale1 * q - lr_over_2l * (term1 @ q)
+            # p = scale1 * p - lr_over_2l * (p @ term1)
             q_new = (p + p.T) / 2
             
         return q_new, l_new
