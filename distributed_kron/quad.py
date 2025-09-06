@@ -10,7 +10,7 @@ from jax import numpy as jnp, vmap
 from jax.sharding import PartitionSpec
 from jax.lax import with_sharding_constraint
 from optax import tree_utils as otu
-from optax._src import base, transform, numerics
+from optax._src import base, transform
 from optax._src.numerics import safe_int32_increment
 from optax._src.utils import canonicalize_dtype
 from optax._src.combine import chain
@@ -30,6 +30,7 @@ PartitionSpecTree = TypeVar(
 
 
 def scale_by_quad(
+    lr_style: str | None = "adam",
     b1: float = 0.95,
     normalize_grads: bool = False,
     max_size_dense: int = 8192,
@@ -41,10 +42,10 @@ def scale_by_quad(
     scanned_layers: Optional[base.Params] = None,
     lax_map_scanned_layers: bool = False,
     lax_map_batch_size: int = 8,
-    merge_small_dims: bool = True,
+    merge_small_dims: bool = False,
     target_merged_dim_size: int = 8192,
     partition_grads_into_blocks: bool = False,
-    block_size: int = 512,
+    block_size: int = 256,
     params_partition_specs: Optional[PartitionSpecTree] = None,
     preconditioner_partition_spec: Optional[tuple[str | None, str | None]] = None,
     **kwargs,
@@ -53,7 +54,8 @@ def scale_by_quad(
     Implements PSGD-QUAD from https://github.com/lixilinx/psgd_torch.
     Author: https://github.com/evanatyourservice
 
-            Args:
+    Args:
+        lr_style: str | None, learning rate scale, "adam" RMS≈0.2 or None for PSGD's RMS=1.0.
         b1: float, momentum parameter. 0.9 or 0.95 are common values.
         max_size_dense: int, dimensions larger than this will have diagonal preconditioners,
             otherwise dense.
@@ -487,7 +489,7 @@ def scale_by_quad(
         if have_qs_sharding:
             Qs = _safe_sharding_constraint(Qs, Qs_sharding)
 
-        # update Qs
+        # update Qs and precondition gradients
         key = jax.random.fold_in(jax.random.PRNGKey(42), state["count"])
         flat_updates, updates_struct = jax.tree.flatten(momentum_updates)
         flat_leaf_keys = jax.random.split(key, len(flat_updates))
@@ -538,6 +540,13 @@ def scale_by_quad(
             precond_gs = _safe_sharding_constraint(precond_gs, partitioned_sharding)
         # cast Qs back to precond_dtype
         Qs = otu.tree_cast(Qs, precond_dtype)
+
+        # clip preconditioned gradients to max RMS=1.05 and apply lr style
+        precond_gs = jax.tree.map(
+            lambda g: g / jnp.clip(jnp.sqrt(jnp.mean(jnp.square(g))), min=1.05), precond_gs
+        )
+        if lr_style == "adam":
+            precond_gs = jax.tree.map(lambda g: g / 5.0, precond_gs)
 
         # unpartition grads
         if partition_grads_into_blocks:
@@ -603,6 +612,7 @@ def scale_by_quad(
 
 def quad(
     learning_rate: Union[float, Callable[[int], float]] = 0.0003,
+    lr_style: str | None = "adam",
     b1: float = 0.95,
     weight_decay: float = 0.5,
     weight_decay_mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None,
@@ -616,10 +626,10 @@ def quad(
     scanned_layers: Optional[base.Params] = None,
     lax_map_scanned_layers: bool = False,
     lax_map_batch_size: int = 8,
-    merge_small_dims: bool = True,
+    merge_small_dims: bool = False,
     target_merged_dim_size: int = 8192,
     partition_grads_into_blocks: bool = False,
-    block_size: int = 512,
+    block_size: int = 256,
     params_partition_specs: Optional[PartitionSpecTree] = None,
     preconditioner_partition_spec: Optional[tuple[str | None, str | None]] = None,
 ) -> base.GradientTransformation:
@@ -629,6 +639,7 @@ def quad(
 
     Args:
         learning_rate: float or callable, learning rate schedule.
+        lr_style: str | None, learning rate scale, "adam" RMS≈0.2 or None for PSGD's RMS=1.0.
         b1: float, momentum parameter. 0.9 or 0.95 are common values.
         weight_decay: float, weight decay coefficient.
         weight_decay_mask: optional pytree same structure as params, or callable
@@ -669,6 +680,7 @@ def quad(
     """
     optimizer = [
         scale_by_quad(
+            lr_style=lr_style,
             b1=b1,
             normalize_grads=normalize_grads,
             max_size_dense=max_size_dense,
@@ -826,35 +838,30 @@ def _init_Q_exprs(
 
 
 def get_precond_lr(base_lr: float, step: jax.Array):
-    return jnp.maximum(base_lr * jax.lax.rsqrt(1.0 + step / 10000.0), 0.2)
+    return jnp.maximum(base_lr * jax.lax.rsqrt(1.0 + step / 10000.0), 0.3)
 
 
 def _norm_lower_bound(A: jax.Array):
     max_abs = jnp.max(jnp.abs(jnp.diag(A)))
-    
-    def _inner():
-        A_normalized = A / max_abs
-        row_norms_sq = jnp.sum(A_normalized * A_normalized, axis=1)
-        j = jnp.argmax(row_norms_sq)
-        x = jax.lax.dynamic_index_in_dim(A_normalized, j, 0, keepdims=False)
-        x = A_normalized @ x
-        x = x / jnp.linalg.norm(x)
-        return jnp.linalg.norm(A_normalized @ x) * max_abs
-    
-    return jax.lax.cond(max_abs > 0, _inner, lambda: max_abs)
+    A /= max_abs
+    j = jnp.argmax(jnp.sum(A * A, axis=1))
+    x = jax.lax.dynamic_index_in_dim(A, j, 0, keepdims=False)
+    x = A @ x
+    x /= jnp.linalg.norm(x)
+    return jnp.linalg.norm(A @ x) * max_abs
 
 
 def _update_precond(Q, L, G, key, exprs, precond_lr, qs_sharding, params_sharding):
     """Update Q using QUAD method and return preconditioned gradient."""
     exprP, exprGs = exprs
 
-    Pg = jnp.einsum(exprP, *Q, *Q, G + jax.random.normal(key, G.shape, G.dtype) * 1e-8)
-    
+    Pg = jnp.einsum(exprP, *Q, *Q, G + jax.random.normal(key, G.shape, G.dtype) * 1e-9)
+
     total_numel = G.size
     betaL = 0.95
-    def _update_single_q_l(i, q, l): 
+
+    def _update_single_q_l(i, q, l):
         term1 = jnp.einsum(exprGs[i], Pg, Pg)
-        
         if q.ndim < 2:
             term2 = total_numel / q.size
             ell = jnp.max(term1) + term2
@@ -867,15 +874,9 @@ def _update_precond(Q, L, G, key, exprs, precond_lr, qs_sharding, params_shardin
             ell = _norm_lower_bound(term1) + term2
             l_new = jnp.maximum(betaL * l + (1 - betaL) * ell, ell)
             lr_over_2l = (precond_lr / (2 * l_new)).astype(q.dtype)
-            # original
             p = q - lr_over_2l * (term1 @ q - term2 * q)
             p = p - lr_over_2l * (p @ term1 - p * term2)
-            # multiplicative
-            # scale1 = 1 + lr_over_2l * term2
-            # p = scale1 * q - lr_over_2l * (term1 @ q)
-            # p = scale1 * p - lr_over_2l * (p @ term1)
             q_new = (p + p.T) / 2
-            
         return q_new, l_new
 
     Q_L_new = [_update_single_q_l(i, q, l) for i, (q, l) in enumerate(zip(Q, L))]
