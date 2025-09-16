@@ -881,10 +881,11 @@ def _norm_lower_bound(A: jax.Array, skh: bool = False) -> jax.Array:
         scale = jnp.max(jnp.diag(A))
     A /= scale
     j = jnp.argmax(jnp.sum(A * A, axis=1))
-    x = jax.lax.dynamic_index_in_dim(A, j, 0, keepdims=False) @ A
-    x = x / jnp.linalg.norm(x)
-    x = jnp.linalg.norm(x @ A)
-    return x * scale
+    x = jax.lax.dynamic_index_in_dim(A, j, 0, keepdims=False)
+    for _ in range(2):
+        x = x @ A
+        x = x / jnp.linalg.norm(x)
+    return jnp.linalg.norm(x @ A) * scale
 
 
 def _dense_update(term1: jax.Array, term2: jax.Array, L: jax.Array, Q: jax.Array, lr_precond: jax.Array):
@@ -906,7 +907,7 @@ def _dense_update_q0p5eq1p5(term1: jax.Array, term2: jax.Array, L: jax.Array, Q:
     return Qn, L
 
 
-def _procrustes_step(Q: jax.Array, max_step_size: float = 0.2) -> jax.Array:
+def _procrustes_step(Q: jax.Array, max_step_size: float = 1/8) -> jax.Array:
     R = Q.T - Q
     max_abs = jnp.max(jnp.abs(R))
 
