@@ -93,9 +93,7 @@ def scale_by_quad(
 
     def init_fn(params):
         params_unboxed = jax.tree.map(
-            lambda x: x.unbox() if isinstance(x, nn.Partitioned) else x,
-            params,
-            is_leaf=lambda x: isinstance(x, nn.Partitioned),
+            lambda x: x.unbox() if isinstance(x, nn.Partitioned) else x, params, is_leaf=lambda x: isinstance(x, nn.Partitioned)
         )
 
         mu = None
@@ -129,15 +127,7 @@ def scale_by_quad(
                 Ql = jnp.ones((B, m_flat), dtype=dtype) * preconditioner_init_scale
                 Ll = jnp.zeros((B,), jnp.float32)
                 large_state.append(
-                    LeafState(
-                        kind=ONE_D_PATH,
-                        scanned=int(scanned),
-                        B=B,
-                        shape=shape_wo,
-                        merged=(m_flat,),
-                        Ql=Ql,
-                        Ll=Ll,
-                    )
+                    LeafState(kind=ONE_D_PATH, scanned=int(scanned), B=B, shape=shape_wo, merged=(m_flat,), Ql=Ql, Ll=Ll)
                 )
                 continue
 
@@ -164,9 +154,7 @@ def scale_by_quad(
                             dense_Lr_list.append(jnp.zeros([], jnp.float32))
                             dense_valid_rc.append((vr, vc))
                 large_state.append(
-                    LeafState(
-                        kind=DENSE_PATH, scanned=int(scanned), B=B, merged=(m, n), nr=nr, nc=nc, block_size=block_size
-                    )
+                    LeafState(kind=DENSE_PATH, scanned=int(scanned), B=B, merged=(m, n), nr=nr, nc=nc, block_size=block_size)
                 )
 
             else:
@@ -202,7 +190,9 @@ def scale_by_quad(
                     num_blocks_per_sample = (dim_to_block + block_size - 1) // block_size
                     stack = B * num_blocks_per_sample
 
-                    Q_diag = jnp.broadcast_to(jnp.ones((1, other_dim), dtype=dtype) * preconditioner_init_scale, (stack, other_dim))
+                    Q_diag = jnp.broadcast_to(
+                        jnp.ones((1, other_dim), dtype=dtype) * preconditioner_init_scale, (stack, other_dim)
+                    )
 
                     Q_blocked_blocks = []
                     for _ in range(B):
@@ -490,10 +480,26 @@ def scale_by_quad(
                     Pg_cat = with_sharding_constraint(Pg_cat, PartitionSpec(pipeline_axis_name))
 
                 state["dense"] = dense_state.replace(
-                    Ql=with_sharding_constraint(otu.tree_cast(Ql_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ql_new, dtype),
-                    Qr=with_sharding_constraint(otu.tree_cast(Qr_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Qr_new, dtype),
-                    Ll=with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ll_new, jnp.float32),
-                    Lr=with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Lr_new, jnp.float32),
+                    Ql=(
+                        with_sharding_constraint(otu.tree_cast(Ql_new, dtype), PartitionSpec(pipeline_axis_name))
+                        if pipeline_axis_name is not None
+                        else otu.tree_cast(Ql_new, dtype)
+                    ),
+                    Qr=(
+                        with_sharding_constraint(otu.tree_cast(Qr_new, dtype), PartitionSpec(pipeline_axis_name))
+                        if pipeline_axis_name is not None
+                        else otu.tree_cast(Qr_new, dtype)
+                    ),
+                    Ll=(
+                        with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), PartitionSpec(pipeline_axis_name))
+                        if pipeline_axis_name is not None
+                        else otu.tree_cast(Ll_new, jnp.float32)
+                    ),
+                    Lr=(
+                        with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), PartitionSpec(pipeline_axis_name))
+                        if pipeline_axis_name is not None
+                        else otu.tree_cast(Lr_new, jnp.float32)
+                    ),
                 )
 
                 valid_count = _get(dense_state, "valid_count")
@@ -552,15 +558,45 @@ def scale_by_quad(
 
                 Ql_new, Qr_new, Ll_new, Lr_new, Pg = vmap(
                     _preconditioning, in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, None, None, None, None)
-                )(keys, Ql_in, Qr_in, Ll_in, Lr_in, Gs, valid_shape_large, True, True, plr, noise_scale, diag_update_fn, dense_update_fn)
+                )(
+                    keys,
+                    Ql_in,
+                    Qr_in,
+                    Ll_in,
+                    Lr_in,
+                    Gs,
+                    valid_shape_large,
+                    True,
+                    True,
+                    plr,
+                    noise_scale,
+                    diag_update_fn,
+                    dense_update_fn,
+                )
                 if pipeline_axis_name is not None:
                     Pg = with_sharding_constraint(Pg, PartitionSpec(pipeline_axis_name))
 
                 state["large"][leaf_idx] = st.replace(
-                    Ql=with_sharding_constraint(otu.tree_cast(Ql_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ql_new, dtype),
-                    Qr=with_sharding_constraint(otu.tree_cast(Qr_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Qr_new, dtype),
-                    Ll=with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ll_new, jnp.float32),
-                    Lr=with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Lr_new, jnp.float32),
+                    Ql=(
+                        with_sharding_constraint(otu.tree_cast(Ql_new, dtype), PartitionSpec(pipeline_axis_name))
+                        if pipeline_axis_name is not None
+                        else otu.tree_cast(Ql_new, dtype)
+                    ),
+                    Qr=(
+                        with_sharding_constraint(otu.tree_cast(Qr_new, dtype), PartitionSpec(pipeline_axis_name))
+                        if pipeline_axis_name is not None
+                        else otu.tree_cast(Qr_new, dtype)
+                    ),
+                    Ll=(
+                        with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), PartitionSpec(pipeline_axis_name))
+                        if pipeline_axis_name is not None
+                        else otu.tree_cast(Ll_new, jnp.float32)
+                    ),
+                    Lr=(
+                        with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), PartitionSpec(pipeline_axis_name))
+                        if pipeline_axis_name is not None
+                        else otu.tree_cast(Lr_new, jnp.float32)
+                    ),
                 )
 
                 Pg = Pg[:B]
@@ -625,10 +661,26 @@ def scale_by_quad(
                     Pg = with_sharding_constraint(Pg, PartitionSpec(pipeline_axis_name))
 
                 state["large"][leaf_idx] = st.replace(
-                    Ql=with_sharding_constraint(otu.tree_cast(Ql_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ql_new, dtype),
-                    Qr=with_sharding_constraint(otu.tree_cast(Qr_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Qr_new, dtype),
-                    Ll=with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ll_new, jnp.float32),
-                    Lr=with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Lr_new, jnp.float32),
+                    Ql=(
+                        with_sharding_constraint(otu.tree_cast(Ql_new, dtype), PartitionSpec(pipeline_axis_name))
+                        if pipeline_axis_name is not None
+                        else otu.tree_cast(Ql_new, dtype)
+                    ),
+                    Qr=(
+                        with_sharding_constraint(otu.tree_cast(Qr_new, dtype), PartitionSpec(pipeline_axis_name))
+                        if pipeline_axis_name is not None
+                        else otu.tree_cast(Qr_new, dtype)
+                    ),
+                    Ll=(
+                        with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), PartitionSpec(pipeline_axis_name))
+                        if pipeline_axis_name is not None
+                        else otu.tree_cast(Ll_new, jnp.float32)
+                    ),
+                    Lr=(
+                        with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), PartitionSpec(pipeline_axis_name))
+                        if pipeline_axis_name is not None
+                        else otu.tree_cast(Lr_new, jnp.float32)
+                    ),
                 )
 
                 Pg = Pg[: (B * num_blocks_per_sample)]
@@ -645,14 +697,11 @@ def scale_by_quad(
             key = jax.random.fold_in(jax.random.PRNGKey(46), step)
             keys = jax.random.split(key, B)
 
-            Ql_new, Ll_new, Pg_flat = vmap(
-                _preconditioning_one_d, in_axes=(0, 0, 0, 0, None, None, None)
-            )(keys, st.Ql, st.Ll, g2d, plr, noise_scale, diag_update_fn)
-
-            state["large"][leaf_idx] = st.replace(
-                Ql=otu.tree_cast(Ql_new, dtype),
-                Ll=otu.tree_cast(Ll_new, jnp.float32),
+            Ql_new, Ll_new, Pg_flat = vmap(_preconditioning_one_d, in_axes=(0, 0, 0, 0, None, None, None))(
+                keys, st.Ql, st.Ll, g2d, plr, noise_scale, diag_update_fn
             )
+
+            state["large"][leaf_idx] = st.replace(Ql=otu.tree_cast(Ql_new, dtype), Ll=otu.tree_cast(Ll_new, jnp.float32))
             leaves_u[leaf_idx] = jnp.reshape(Pg_flat, g.shape)
 
         precond_all = tdef_u.unflatten(leaves_u)
@@ -660,9 +709,7 @@ def scale_by_quad(
         if params_partition_specs is not None:
             precond_all = with_sharding_constraint(precond_all, params_partition_specs)
 
-        precond_all = jax.tree.map(
-            lambda g: g * (1.1 / jnp.maximum(jnp.sqrt(jnp.mean(jnp.square(g))), 1.1)), precond_all
-        )
+        precond_all = jax.tree.map(lambda g: g * (1.1 / jnp.maximum(jnp.sqrt(jnp.mean(jnp.square(g))), 1.1)), precond_all)
 
         if lr_style == "adam":
             precond_all = jax.tree.map(lambda g: g / jnp.array(5.0, g.dtype), precond_all)
@@ -774,7 +821,7 @@ def get_opt_state_partition_specs(params, **quad_kwargs):
     else:
         mu_specs = None
 
-    def _to_specs(x, key_path: Tuple[Any, ...] = ()): 
+    def _to_specs(x, key_path: Tuple[Any, ...] = ()):
         if isinstance(x, jax.ShapeDtypeStruct):
             return _leading_axis_spec(x.ndim)
         if isinstance(x, LeafState):
@@ -924,7 +971,7 @@ def _preconditioning(
     if not diag_left and not diag_right:
         # DD
         Pg = jax.numpy.linalg.multi_dot([Ql, Ql, Gn, Qr, Qr])
-        
+
         term1L = Pg @ Pg.T
         term2L = total_numel / m
         Ql_new, Ll_new = dense_update_fn(term1L, term2L, Ll, Ql, lr_precond)
@@ -970,24 +1017,18 @@ def _preconditioning(
         term1L = jnp.sum(Pg * Pg, axis=1)
         term2L = total_numel / m
         Ql_new, Ll_new = diag_update_fn(term1L, term2L, Ll, Ql, lr_precond)
-        
+
         term1R = jnp.sum(Pg * Pg, axis=0)
         term2R = total_numel / n
         Qr_new, Lr_new = diag_update_fn(term1R, term2R, Lr, Qr, lr_precond)
-        
+
         Pg_out = (Ql_new * Ql_new)[:, None] * G * (Qr_new * Qr_new)[None, :]
 
     return Ql_new, Qr_new, Ll_new, Lr_new, Pg_out
 
 
 def _preconditioning_one_d(
-    key: jax.Array,
-    Q: jax.Array,
-    L: jax.Array,
-    G: jax.Array,
-    lr_precond: jax.Array,
-    noise_scale: float,
-    diag_update_fn: Callable,
+    key: jax.Array, Q: jax.Array, L: jax.Array, G: jax.Array, lr_precond: jax.Array, noise_scale: float, diag_update_fn: Callable
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
     noise = jax.random.normal(key, G.shape, G.dtype) * noise_scale
     Gn = G + noise
