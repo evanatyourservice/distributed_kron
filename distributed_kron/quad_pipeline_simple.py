@@ -1,18 +1,3 @@
-"""simplified pipeline-sharded psgd-quad in jax/optax.
-
-key ideas:
-  - merge tensor dimensions to 2d before grouping.
-  - groups: dense (both axes <= max_size_dense), large (>=1 axis > max_size_dense), and one_d.
-  - block dense axes only. pad edge blocks with zeros (gradients) or zero-padded identity matrices (q).
-  - dense tensors: concatenate all blocks, shard along the pipeline axis, and keep q/l sharded.
-  - large tensors: block only the dense axis, pad each leaf's block stack to the pipeline axis, and shard per-leaf.
-  - one_d tensors: sign(momentum) update (1d whitening).
-  - matmul-based updates (no einsum).
-  - l and q use dtype (bf16 or f32).
-
-author: https://github.com/evanatyourservice
-"""
-
 from typing import Any, Callable, Optional, Tuple, Union, List, Dict
 
 import numpy as np
