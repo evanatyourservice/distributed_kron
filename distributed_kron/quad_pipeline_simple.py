@@ -13,8 +13,6 @@ key ideas:
 author: https://github.com/evanatyourservice
 """
 
-from __future__ import annotations
-
 from typing import Any, Callable, Optional, Tuple, Union, List, Dict
 
 import numpy as np
@@ -24,20 +22,13 @@ import jax.numpy as jnp
 from jax import vmap
 from jax.lax import with_sharding_constraint
 from jax.sharding import PartitionSpec
-
 from optax._src import base, transform
 from optax._src.combine import chain
 from optax._src.numerics import safe_int32_increment
 from optax._src.utils import canonicalize_dtype
 from optax import tree_utils as otu
-
-try:
-    import flax.linen as nn
-    from flax import struct
-    HAVE_FLAX = True
-except Exception:
-    nn = None
-    HAVE_FLAX = False
+from flax import linen as nn
+from flax import struct
 
 
 DENSE_PATH = 0
@@ -45,37 +36,37 @@ LARGE_PATH = 1
 ONE_D_PATH = 2
 
 
-if HAVE_FLAX:
-    @struct.dataclass
-    class DenseState:
-        Ql: jax.Array
-        Qr: jax.Array
-        Ll: jax.Array
-        Lr: jax.Array
-        valid_rows: jax.Array
-        valid_cols: jax.Array
-        valid_count: int = struct.field(pytree_node=False)
-        block_size: int = struct.field(pytree_node=False)
+@struct.dataclass
+class DenseState:
+    Ql: jax.Array
+    Qr: jax.Array
+    Ll: jax.Array
+    Lr: jax.Array
+    valid_rows: jax.Array
+    valid_cols: jax.Array
+    valid_count: int = struct.field(pytree_node=False)
+    block_size: int = struct.field(pytree_node=False)
 
-    @struct.dataclass
-    class LeafState:
-        kind: int = struct.field(pytree_node=False)
-        scanned: int = struct.field(pytree_node=False)
-        B: int = struct.field(pytree_node=False)
-        shape: Optional[Tuple[int, ...]] = struct.field(pytree_node=False, default=None)
-        merged: Optional[Tuple[int, ...]] = struct.field(pytree_node=False, default=None)
-        nr: Optional[int] = struct.field(pytree_node=False, default=None)
-        nc: Optional[int] = struct.field(pytree_node=False, default=None)
-        block_size: Optional[int] = struct.field(pytree_node=False, default=None)
-        diag_left: Optional[bool] = struct.field(pytree_node=False, default=None)
-        diag_right: Optional[bool] = struct.field(pytree_node=False, default=None)
-        stack: Optional[int] = struct.field(pytree_node=False, default=None)
-        Ql: Optional[jax.Array] = None
-        Qr: Optional[jax.Array] = None
-        Ll: Optional[jax.Array] = None
-        Lr: Optional[jax.Array] = None
-else:
-    LeafState = dict
+
+@struct.dataclass
+class LeafState:
+    kind: int = struct.field(pytree_node=False)
+    scanned: int = struct.field(pytree_node=False)
+    B: int = struct.field(pytree_node=False)
+    shape: Optional[Tuple[int, ...]] = struct.field(pytree_node=False, default=None)
+    merged: Optional[Tuple[int, ...]] = struct.field(pytree_node=False, default=None)
+    nr: Optional[int] = struct.field(pytree_node=False, default=None)
+    nc: Optional[int] = struct.field(pytree_node=False, default=None)
+    block_size: Optional[int] = struct.field(pytree_node=False, default=None)
+    diag_left: Optional[bool] = struct.field(pytree_node=False, default=None)
+    diag_right: Optional[bool] = struct.field(pytree_node=False, default=None)
+    stack: Optional[int] = struct.field(pytree_node=False, default=None)
+    Ql: Optional[jax.Array] = None
+    Qr: Optional[jax.Array] = None
+    Ll: Optional[jax.Array] = None
+    Lr: Optional[jax.Array] = None
+    valid_rows: Optional[jax.Array] = None
+    valid_cols: Optional[jax.Array] = None
 
 
 def scale_by_quad(
@@ -85,28 +76,27 @@ def scale_by_quad(
     max_size_dense: int = 8192,
     preconditioner_lr: float = 0.7,
     preconditioner_init_scale: float = 1.0,
+    preconditioner_update_style: str = "QUAD",
     dtype: Union[str, jnp.dtype] = jnp.bfloat16,
     scanned_layers: Optional[base.Params] = None,
     block_size: int = 256,
     pipeline_axis_name: Optional[str] = None,
     pipeline_axis_size: int = 1,
     params_partition_specs: Optional[Union[PartitionSpec, List, Tuple, Dict]] = None,
-    noise_scale: float = 1e-8,
+    noise_scale: float = 1e-9,
 ) -> base.GradientTransformation:
 
     dtype = canonicalize_dtype(dtype)
     assert dtype in (jnp.bfloat16, jnp.float32), "dtype must be bfloat16 or float32"
     assert block_size is None or block_size > 0, "block_size must be positive"
+    assert preconditioner_update_style in ("QUAD", "Q0p5EQ1p5"), "preconditioner_update_style must be QUAD or Q0p5EQ1p5"
 
     def init_fn(params):
-        if HAVE_FLAX:
-            params_unboxed = jax.tree.map(
-                lambda x: x.unbox() if isinstance(x, nn.Partitioned) else x,
-                params,
-                is_leaf=lambda x: isinstance(x, nn.Partitioned),
-            )
-        else:
-            params_unboxed = params
+        params_unboxed = jax.tree.map(
+            lambda x: x.unbox() if isinstance(x, nn.Partitioned) else x,
+            params,
+            is_leaf=lambda x: isinstance(x, nn.Partitioned),
+        )
 
         mu = None
         if b1 > 0:
@@ -135,7 +125,20 @@ def scale_by_quad(
 
             merged = _merge_dims(shape_wo)
             if len(merged) <= 1:
-                large_state.append(LeafState(kind=ONE_D_PATH, scanned=int(scanned), B=B, shape=shape_wo))
+                m_flat = int(np.prod(shape_wo)) if len(shape_wo) > 0 else 1
+                Ql = jnp.ones((B, m_flat), dtype=dtype) * preconditioner_init_scale
+                Ll = jnp.zeros((B,), jnp.float32)
+                large_state.append(
+                    LeafState(
+                        kind=ONE_D_PATH,
+                        scanned=int(scanned),
+                        B=B,
+                        shape=shape_wo,
+                        merged=(m_flat,),
+                        Ql=Ql,
+                        Ll=Ll,
+                    )
+                )
                 continue
 
             m, n = merged
@@ -241,7 +244,6 @@ def scale_by_quad(
                         )
                     )
                 else:
-                    # should not happen: handled by is_dense above
                     raise AssertionError("unexpected large case.")
 
         if dense_Ql_list:
@@ -259,7 +261,6 @@ def scale_by_quad(
             else:
                 pad = 0
             if pad > 0:
-                # fake entries: identity q, ones l, ones grads
                 eye = jnp.eye(block_size, dtype=dtype)
                 Ql_pad = jnp.broadcast_to(eye, (pad, block_size, block_size))
                 Qr_pad = jnp.broadcast_to(eye, (pad, block_size, block_size))
@@ -279,28 +280,16 @@ def scale_by_quad(
                 Lr_cat = with_sharding_constraint(Lr_cat, PartitionSpec(pipeline_axis_name))
                 valid_rows = with_sharding_constraint(valid_rows, PartitionSpec(pipeline_axis_name))
                 valid_cols = with_sharding_constraint(valid_cols, PartitionSpec(pipeline_axis_name))
-            if HAVE_FLAX:
-                dense_state = DenseState(
-                    Ql=Ql_cat,
-                    Qr=Qr_cat,
-                    Ll=Ll_cat,
-                    Lr=Lr_cat,
-                    valid_rows=valid_rows,
-                    valid_cols=valid_cols,
-                    valid_count=int(valid_count),
-                    block_size=int(block_size),
-                )
-            else:
-                dense_state = dict(
-                    Ql=Ql_cat,
-                    Qr=Qr_cat,
-                    Ll=Ll_cat,
-                    Lr=Lr_cat,
-                    valid_rows=valid_rows,
-                    valid_cols=valid_cols,
-                    valid_count=int(valid_count),
-                    block_size=int(block_size),
-                )
+            dense_state = DenseState(
+                Ql=Ql_cat,
+                Qr=Qr_cat,
+                Ll=Ll_cat,
+                Lr=Lr_cat,
+                valid_rows=valid_rows,
+                valid_cols=valid_cols,
+                valid_count=int(valid_count),
+                block_size=int(block_size),
+            )
         else:
             dense_state = None
 
@@ -311,6 +300,7 @@ def scale_by_quad(
             updates = {}
             current_Ql, current_Qr, current_Ll, current_Lr = st.Ql, st.Qr, st.Ll, st.Lr
             current_stack = st.stack
+            m, n = st.merged
 
             if pipeline_axis_size > 1:
                 pad = (-current_stack) % pipeline_axis_size
@@ -341,11 +331,47 @@ def scale_by_quad(
             updates["Lr"] = current_Lr
             updates["stack"] = current_stack
 
+            if st.diag_left and st.diag_right:
+                current_valid_rows = jnp.full((current_stack,), m, jnp.int32)
+                current_valid_cols = jnp.full((current_stack,), n, jnp.int32)
+            elif st.diag_left != st.diag_right:
+                block_rows = not st.diag_left
+                num_blocks_per_sample = st.nr if block_rows else st.nc
+                dim_to_block = m if block_rows else n
+                other_dim = n if block_rows else m
+
+                if num_blocks_per_sample and num_blocks_per_sample > 0:
+                    last_block_v = dim_to_block - st.block_size * (num_blocks_per_sample - 1)
+                    v_one_sample = jnp.full((num_blocks_per_sample,), st.block_size, dtype=jnp.int32).at[-1].set(last_block_v)
+                else:
+                    v_one_sample = jnp.array([], dtype=jnp.int32)
+                v_all_samples = jnp.tile(v_one_sample, st.B)
+
+                if v_all_samples.shape[0] < current_stack:
+                    p = current_stack - v_all_samples.shape[0]
+                    pad_vals = jnp.full((p,), st.block_size, dtype=jnp.int32)
+                    v_all_samples = jnp.concatenate([v_all_samples, pad_vals], axis=0)
+
+                other_dim_arr = jnp.full_like(v_all_samples, other_dim)
+                if block_rows:
+                    current_valid_rows = v_all_samples
+                    current_valid_cols = other_dim_arr
+                else:
+                    current_valid_rows = other_dim_arr
+                    current_valid_cols = v_all_samples
+            else:
+                raise AssertionError
+
             if pipeline_axis_name is not None:
                 updates["Ql"] = with_sharding_constraint(updates["Ql"], PartitionSpec(pipeline_axis_name))
                 updates["Qr"] = with_sharding_constraint(updates["Qr"], PartitionSpec(pipeline_axis_name))
                 updates["Ll"] = with_sharding_constraint(updates["Ll"], PartitionSpec(pipeline_axis_name))
                 updates["Lr"] = with_sharding_constraint(updates["Lr"], PartitionSpec(pipeline_axis_name))
+                current_valid_rows = with_sharding_constraint(current_valid_rows, PartitionSpec(pipeline_axis_name))
+                current_valid_cols = with_sharding_constraint(current_valid_cols, PartitionSpec(pipeline_axis_name))
+
+            updates["valid_rows"] = current_valid_rows
+            updates["valid_cols"] = current_valid_cols
 
             large_state[i] = st.replace(**updates)
 
@@ -356,14 +382,23 @@ def scale_by_quad(
 
     def update_fn(updates: base.Updates, state: dict, params: base.Params | None = None):
         step = safe_int32_increment(state["count"])
-        plr = jnp.maximum(preconditioner_lr * jax.lax.rsqrt(1.0 + step / 10000.0), 0.3)
+        plr = jnp.maximum(preconditioner_lr * jax.lax.rsqrt(1.0 + step / 10000.0), 0.4)
+        balance = jnp.equal(step % 100, 0)
+
+        if preconditioner_update_style == "QUAD":
+            dense_update_fn = _dense_update
+            diag_update_fn = _diag_update
+        elif preconditioner_update_style == "Q0p5EQ1p5":
+            dense_update_fn = _dense_update_q0p5eq1p5
+            diag_update_fn = _diag_update_q0p5eq1p5
+        else:
+            raise ValueError(f"Unknown preconditioner_update_style: {preconditioner_update_style}")
 
         flax_partitioned = False
-        if HAVE_FLAX:
-            flat, tdef = jax.tree.flatten(updates, is_leaf=lambda g: isinstance(g, (nn.Partitioned, jax.ShapeDtypeStruct)))
-            if any(isinstance(g, nn.Partitioned) for g in flat):
-                updates = tdef.unflatten([g.unbox() if isinstance(g, nn.Partitioned) else g for g in flat])
-                flax_partitioned = True
+        flat, tdef = jax.tree.flatten(updates, is_leaf=lambda g: isinstance(g, (nn.Partitioned, jax.ShapeDtypeStruct)))
+        if any(isinstance(g, nn.Partitioned) for g in flat):
+            updates = tdef.unflatten([g.unbox() if isinstance(g, nn.Partitioned) else g for g in flat])
+            flax_partitioned = True
 
         mu = state["mu"]
         mupd = updates
@@ -423,17 +458,19 @@ def scale_by_quad(
                 valid_shape_dense = jnp.stack([_get(dense_state, "valid_rows"), _get(dense_state, "valid_cols")], axis=1)
                 if pipeline_axis_name is not None:
                     valid_shape_dense = with_sharding_constraint(valid_shape_dense, PartitionSpec(pipeline_axis_name))
-                    Ql_in = with_sharding_constraint(_get(dense_state, "Ql"), PartitionSpec(pipeline_axis_name))
-                    Qr_in = with_sharding_constraint(_get(dense_state, "Qr"), PartitionSpec(pipeline_axis_name))
+                    Ql_c = with_sharding_constraint(_get(dense_state, "Ql"), PartitionSpec(pipeline_axis_name))
+                    Qr_c = with_sharding_constraint(_get(dense_state, "Qr"), PartitionSpec(pipeline_axis_name))
                     Ll_in = with_sharding_constraint(_get(dense_state, "Ll"), PartitionSpec(pipeline_axis_name))
                     Lr_in = with_sharding_constraint(_get(dense_state, "Lr"), PartitionSpec(pipeline_axis_name))
                 else:
-                    Ql_in = _get(dense_state, "Ql")
-                    Qr_in = _get(dense_state, "Qr")
+                    Ql_c = _get(dense_state, "Ql")
+                    Qr_c = _get(dense_state, "Qr")
                     Ll_in = _get(dense_state, "Ll")
                     Lr_in = _get(dense_state, "Lr")
+
+                Ql_in, Qr_in = jax.lax.cond(balance, lambda p: _balance_qs(p[0], p[1]), lambda p: p, (Ql_c, Qr_c))
                 Ql_new, Qr_new, Ll_new, Lr_new, Pg_cat = vmap(
-                    _preconditioning, in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, None, None)
+                    _preconditioning, in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, None, None, None, None)
                 )(
                     keys,
                     Ql_in,
@@ -446,23 +483,18 @@ def scale_by_quad(
                     diag_right,
                     plr,
                     noise_scale,
+                    diag_update_fn,
+                    dense_update_fn,
                 )
                 if pipeline_axis_name is not None:
                     Pg_cat = with_sharding_constraint(Pg_cat, PartitionSpec(pipeline_axis_name))
 
-                if not isinstance(dense_state, dict):
-                    state["dense"] = dense_state.replace(
-                        Ql=with_sharding_constraint(otu.tree_cast(Ql_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ql_new, dtype),
-                        Qr=with_sharding_constraint(otu.tree_cast(Qr_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Qr_new, dtype),
-                        Ll=with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ll_new, dtype),
-                        Lr=with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Lr_new, dtype),
-                    )
-                else:
-                    ps = PartitionSpec(pipeline_axis_name) if pipeline_axis_name is not None else None
-                    state["dense"]["Ql"] = with_sharding_constraint(otu.tree_cast(Ql_new, dtype), ps) if ps is not None else otu.tree_cast(Ql_new, dtype)
-                    state["dense"]["Qr"] = with_sharding_constraint(otu.tree_cast(Qr_new, dtype), ps) if ps is not None else otu.tree_cast(Qr_new, dtype)
-                    state["dense"]["Ll"] = with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), ps) if ps is not None else otu.tree_cast(Ll_new, dtype)
-                    state["dense"]["Lr"] = with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), ps) if ps is not None else otu.tree_cast(Lr_new, dtype)
+                state["dense"] = dense_state.replace(
+                    Ql=with_sharding_constraint(otu.tree_cast(Ql_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ql_new, dtype),
+                    Qr=with_sharding_constraint(otu.tree_cast(Qr_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Qr_new, dtype),
+                    Ll=with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ll_new, jnp.float32),
+                    Lr=with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Lr_new, jnp.float32),
+                )
 
                 valid_count = _get(dense_state, "valid_count")
                 Pg_cat = Pg_cat[:valid_count]
@@ -478,12 +510,12 @@ def scale_by_quad(
                     nb = B * nr * nc
                     blocks = pg_dense_blocks[start_idx : start_idx + nb]
                     start_idx += nb
-                    rec = _unblock2d(blocks, (nr, nc, m, n), _get(dense_state, "block_size"))  # [B, m, n]
+                    rec = _unblock2d(blocks, (nr, nc, m, n), _get(dense_state, "block_size"))
                     leaves_u[leaf_idx] = jnp.reshape(rec, leaf.shape)
 
         for leaf_idx, (leaf, st) in enumerate(zip(leaves_u, perleaf_state)):
             if st.kind != LARGE_PATH:
-                continue  # not a LARGE leaf
+                continue
             B = st.B
             m, n = st.merged
             diag_left = st.diag_left
@@ -505,24 +537,30 @@ def scale_by_quad(
                     keys = with_sharding_constraint(keys, PartitionSpec(pipeline_axis_name))
 
                 if pipeline_axis_name is not None:
-                    Ql_in = with_sharding_constraint(st.Ql, PartitionSpec(pipeline_axis_name))
-                    Qr_in = with_sharding_constraint(st.Qr, PartitionSpec(pipeline_axis_name))
+                    Ql_c = with_sharding_constraint(st.Ql, PartitionSpec(pipeline_axis_name))
+                    Qr_c = with_sharding_constraint(st.Qr, PartitionSpec(pipeline_axis_name))
                     Ll_in = with_sharding_constraint(st.Ll, PartitionSpec(pipeline_axis_name))
                     Lr_in = with_sharding_constraint(st.Lr, PartitionSpec(pipeline_axis_name))
                 else:
-                    Ql_in, Qr_in, Ll_in, Lr_in = st.Ql, st.Qr, st.Ll, st.Lr
+                    Ql_c, Qr_c, Ll_in, Lr_in = st.Ql, st.Qr, st.Ll, st.Lr
+
+                Ql_in, Qr_in = jax.lax.cond(balance, lambda p: _balance_qs(p[0], p[1]), lambda p: p, (Ql_c, Qr_c))
+
+                valid_shape_large = jnp.stack([st.valid_rows, st.valid_cols], axis=1)
+                if pipeline_axis_name is not None:
+                    valid_shape_large = with_sharding_constraint(valid_shape_large, PartitionSpec(pipeline_axis_name))
 
                 Ql_new, Qr_new, Ll_new, Lr_new, Pg = vmap(
-                    _preconditioning, in_axes=(0, 0, 0, 0, 0, 0, None, None, None, None, None)
-                )(keys, Ql_in, Qr_in, Ll_in, Lr_in, Gs, (m, n), True, True, plr, noise_scale)
+                    _preconditioning, in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, None, None, None, None)
+                )(keys, Ql_in, Qr_in, Ll_in, Lr_in, Gs, valid_shape_large, True, True, plr, noise_scale, diag_update_fn, dense_update_fn)
                 if pipeline_axis_name is not None:
                     Pg = with_sharding_constraint(Pg, PartitionSpec(pipeline_axis_name))
 
                 state["large"][leaf_idx] = st.replace(
                     Ql=with_sharding_constraint(otu.tree_cast(Ql_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ql_new, dtype),
                     Qr=with_sharding_constraint(otu.tree_cast(Qr_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Qr_new, dtype),
-                    Ll=with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ll_new, dtype),
-                    Lr=with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Lr_new, dtype),
+                    Ll=with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ll_new, jnp.float32),
+                    Lr=with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Lr_new, jnp.float32),
                 )
 
                 Pg = Pg[:B]
@@ -553,47 +591,44 @@ def scale_by_quad(
                 if pipeline_axis_name is not None:
                     keys = with_sharding_constraint(keys, PartitionSpec(pipeline_axis_name))
 
-                dim_to_block = m if block_rows else n
-                if num_blocks_per_sample > 0:
-                    last_block_v = dim_to_block - block_size * (num_blocks_per_sample - 1)
-                    v_one_sample = jnp.full((num_blocks_per_sample,), block_size, dtype=jnp.int32).at[-1].set(last_block_v)
-                else:
-                    v_one_sample = jnp.array([], dtype=jnp.int32)
-
-                v_all_samples = jnp.tile(v_one_sample, B)
-                other_dim_arr = jnp.full_like(v_all_samples, other_dim)
-
-                if block_rows:
-                    valid_shape_large = jnp.stack([v_all_samples, other_dim_arr], axis=1)
-                else:
-                    valid_shape_large = jnp.stack([other_dim_arr, v_all_samples], axis=1)
-
-                if valid_shape_large.shape[0] < stack:
-                    pad = stack - valid_shape_large.shape[0]
-                    pad_shape_tuple = (block_size, other_dim) if block_rows else (other_dim, block_size)
-                    pad_arr = jnp.broadcast_to(jnp.array(pad_shape_tuple, dtype=jnp.int32), (pad, 2))
-                    valid_shape_large = jnp.concatenate([valid_shape_large, pad_arr])
+                valid_shape_large = jnp.stack([st.valid_rows, st.valid_cols], axis=1)
 
                 if pipeline_axis_name is not None:
                     valid_shape_large = with_sharding_constraint(valid_shape_large, PartitionSpec(pipeline_axis_name))
-                    Ql_in = with_sharding_constraint(st.Ql, PartitionSpec(pipeline_axis_name))
-                    Qr_in = with_sharding_constraint(st.Qr, PartitionSpec(pipeline_axis_name))
+                    Ql_c = with_sharding_constraint(st.Ql, PartitionSpec(pipeline_axis_name))
+                    Qr_c = with_sharding_constraint(st.Qr, PartitionSpec(pipeline_axis_name))
                     Ll_in = with_sharding_constraint(st.Ll, PartitionSpec(pipeline_axis_name))
                     Lr_in = with_sharding_constraint(st.Lr, PartitionSpec(pipeline_axis_name))
                 else:
-                    Ql_in, Qr_in, Ll_in, Lr_in = st.Ql, st.Qr, st.Ll, st.Lr
+                    Ql_c, Qr_c, Ll_in, Lr_in = st.Ql, st.Qr, st.Ll, st.Lr
+
+                Ql_in, Qr_in = jax.lax.cond(balance, lambda p: _balance_qs(p[0], p[1]), lambda p: p, (Ql_c, Qr_c))
 
                 Ql_new, Qr_new, Ll_new, Lr_new, Pg = vmap(
-                    _preconditioning, in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, None, None)
-                )(keys, Ql_in, Qr_in, Ll_in, Lr_in, Gs, valid_shape_large, diag_left, diag_right, plr, noise_scale)
+                    _preconditioning, in_axes=(0, 0, 0, 0, 0, 0, 0, None, None, None, None, None, None)
+                )(
+                    keys,
+                    Ql_in,
+                    Qr_in,
+                    Ll_in,
+                    Lr_in,
+                    Gs,
+                    valid_shape_large,
+                    diag_left,
+                    diag_right,
+                    plr,
+                    noise_scale,
+                    diag_update_fn,
+                    dense_update_fn,
+                )
                 if pipeline_axis_name is not None:
                     Pg = with_sharding_constraint(Pg, PartitionSpec(pipeline_axis_name))
 
                 state["large"][leaf_idx] = st.replace(
                     Ql=with_sharding_constraint(otu.tree_cast(Ql_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ql_new, dtype),
                     Qr=with_sharding_constraint(otu.tree_cast(Qr_new, dtype), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Qr_new, dtype),
-                    Ll=with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ll_new, dtype),
-                    Lr=with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Lr_new, dtype),
+                    Ll=with_sharding_constraint(otu.tree_cast(Ll_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Ll_new, jnp.float32),
+                    Lr=with_sharding_constraint(otu.tree_cast(Lr_new, jnp.float32), PartitionSpec(pipeline_axis_name)) if pipeline_axis_name is not None else otu.tree_cast(Lr_new, jnp.float32),
                 )
 
                 Pg = Pg[: (B * num_blocks_per_sample)]
@@ -606,9 +641,19 @@ def scale_by_quad(
                 continue
             B = st.B
             g = leaves_mupd[leaf_idx].astype(dtype)
-            # g = jnp.reshape(g, (B, -1))
-            out = jnp.sign(g)
-            leaves_u[leaf_idx] = jnp.reshape(out, leaf.shape)
+            g2d = jnp.reshape(g, (B, -1))
+            key = jax.random.fold_in(jax.random.PRNGKey(46), step)
+            keys = jax.random.split(key, B)
+
+            Ql_new, Ll_new, Pg_flat = vmap(
+                _preconditioning_one_d, in_axes=(0, 0, 0, 0, None, None, None)
+            )(keys, st.Ql, st.Ll, g2d, plr, noise_scale, diag_update_fn)
+
+            state["large"][leaf_idx] = st.replace(
+                Ql=otu.tree_cast(Ql_new, dtype),
+                Ll=otu.tree_cast(Ll_new, jnp.float32),
+            )
+            leaves_u[leaf_idx] = jnp.reshape(Pg_flat, g.shape)
 
         precond_all = tdef_u.unflatten(leaves_u)
 
@@ -616,7 +661,7 @@ def scale_by_quad(
             precond_all = with_sharding_constraint(precond_all, params_partition_specs)
 
         precond_all = jax.tree.map(
-            lambda g: g * (1.05 / jnp.maximum(jnp.sqrt(jnp.mean(jnp.square(g))), 1.05)), precond_all
+            lambda g: g * (1.1 / jnp.maximum(jnp.sqrt(jnp.mean(jnp.square(g))), 1.1)), precond_all
         )
 
         if lr_style == "adam":
@@ -648,13 +693,14 @@ def quad(
     max_size_dense: int = 8192,
     preconditioner_lr: float = 0.7,
     preconditioner_init_scale: float = 1.0,
+    preconditioner_update_style: str = "QUAD",
     dtype: Union[str, jnp.dtype] = jnp.bfloat16,
     scanned_layers: Optional[base.Params] = None,
     block_size: int = 256,
     pipeline_axis_name: Optional[str] = None,
     pipeline_axis_size: int = 1,
     params_partition_specs: Optional[Union[PartitionSpec, List, Tuple, Dict]] = None,
-    noise_scale: float = 1e-8,
+    noise_scale: float = 1e-9,
 ) -> base.GradientTransformation:
     tx = [
         scale_by_quad(
@@ -664,6 +710,7 @@ def quad(
             max_size_dense=max_size_dense,
             preconditioner_lr=preconditioner_lr,
             preconditioner_init_scale=preconditioner_init_scale,
+            preconditioner_update_style=preconditioner_update_style,
             dtype=dtype,
             scanned_layers=scanned_layers,
             block_size=block_size,
@@ -727,17 +774,28 @@ def get_opt_state_partition_specs(params, **quad_kwargs):
     else:
         mu_specs = None
 
-    def _to_specs(x, key_path: Tuple[Any, ...] = ()):
+    def _to_specs(x, key_path: Tuple[Any, ...] = ()): 
         if isinstance(x, jax.ShapeDtypeStruct):
             return _leading_axis_spec(x.ndim)
-        if HAVE_FLAX and isinstance(x, LeafState):
+        if isinstance(x, LeafState):
+            if x.kind == ONE_D_PATH:
+                return x.replace(
+                    Ql=replicated if isinstance(x.Ql, jax.ShapeDtypeStruct) else None,
+                    Qr=None,
+                    Ll=replicated if isinstance(x.Ll, jax.ShapeDtypeStruct) else None,
+                    Lr=None,
+                    valid_rows=replicated if isinstance(x.valid_rows, jax.ShapeDtypeStruct) else None,
+                    valid_cols=replicated if isinstance(x.valid_cols, jax.ShapeDtypeStruct) else None,
+                )
             return x.replace(
                 Ql=_to_specs(x.Ql),
                 Qr=_to_specs(x.Qr),
                 Ll=_to_specs(x.Ll),
                 Lr=_to_specs(x.Lr),
+                valid_rows=_to_specs(x.valid_rows),
+                valid_cols=_to_specs(x.valid_cols),
             )
-        if HAVE_FLAX and isinstance(x, DenseState):
+        if isinstance(x, DenseState):
             return x.replace(
                 Ql=_to_specs(x.Ql),
                 Qr=_to_specs(x.Qr),
@@ -775,25 +833,68 @@ def _diag_update(term1: jax.Array, term2: jax.Array, L: jax.Array, Q: jax.Array,
     return Qn, L
 
 
-def _lb(A: jax.Array) -> jax.Array:
-    """Lower bound for spectral norm of A."""
-    scale = jnp.max(jnp.diag(A))
+# def _diag_update_q0p5eq1p5(term1: jax.Array, term2: jax.Array, L: jax.Array, Q: jax.Array, lr_precond: jax.Array):
+#     ell = jnp.max(term1) + term2
+#     L = jnp.maximum(0.95 * L + 0.05 * ell, ell)
+#     z = (lr_precond / L).astype(Q.dtype)
+#     gain = 1.0 - z * (term1 - term2)
+#     Qn = Q * gain
+#     return Qn, L
+_diag_update_q0p5eq1p5 = _diag_update
+
+
+def _norm_lower_bound(A: jax.Array, skh: bool = False) -> jax.Array:
+    """Returns a cheap lower bound for the spectral norm of A."""
+    if skh:
+        scale = jnp.max(jnp.abs(A))
+    else:
+        scale = jnp.max(jnp.diag(A))
     A /= scale
     j = jnp.argmax(jnp.sum(A * A, axis=1))
-    x = A @ jax.lax.dynamic_index_in_dim(A, j, 0, keepdims=False)
+    x = jax.lax.dynamic_index_in_dim(A, j, 0, keepdims=False) @ A
     x = x / jnp.linalg.norm(x)
-    x = jnp.linalg.norm(A @ x)
+    x = jnp.linalg.norm(x @ A)
     return x * scale
 
 
 def _dense_update(term1: jax.Array, term2: jax.Array, L: jax.Array, Q: jax.Array, lr_precond: jax.Array):
-    ell = _lb(term1) + term2
+    ell = _norm_lower_bound(term1) + term2
     L = jnp.maximum(0.95 * L + 0.05 * ell, ell)
     z = (lr_precond / (2.0 * L)).astype(Q.dtype)
     P = Q - z * (term1 @ Q - term2 * Q)
     P = P - z * (P @ term1 - P * term2)
     Qn = (P + P.T) / 2.0
     return Qn, L
+
+
+def _dense_update_q0p5eq1p5(term1: jax.Array, term2: jax.Array, L: jax.Array, Q: jax.Array, lr_precond: jax.Array):
+    ell = _norm_lower_bound(term1) + term2
+    L = jnp.maximum(0.95 * L + 0.05 * ell, ell)
+    z = (lr_precond / L).astype(Q.dtype)
+    Q_updated = Q - z * (term1 @ Q - term2 * Q)
+    Qn = _procrustes_step(Q_updated)
+    return Qn, L
+
+
+def _procrustes_step(Q: jax.Array, max_step_size: float = 0.2) -> jax.Array:
+    R = Q.T - Q
+    max_abs = jnp.max(jnp.abs(R))
+
+    def update_q(R_local):
+        R_scaled = R_local / max_abs
+        RQ = R_scaled @ Q
+        tr_RQ = jnp.trace(RQ)
+
+        def do_rotation(R_scaled_local, RQ_local, tr_RQ_local):
+            a = max_step_size / _norm_lower_bound(R_scaled_local, skh=True)
+            RRQ = R_scaled_local @ RQ_local
+            tr_RRQ = jnp.trace(RRQ)
+            a = jnp.where(tr_RRQ < 0, jnp.minimum(a, -tr_RQ_local / tr_RRQ), a)
+            return Q + a * (RQ_local + 0.5 * a * RRQ)
+
+        return jax.lax.cond(tr_RQ > 0, lambda: do_rotation(R_scaled, RQ, tr_RQ), lambda: Q)
+
+    return jax.lax.cond(max_abs > jnp.finfo(Q.dtype).tiny, lambda: update_q(R), lambda: Q)
 
 
 def _preconditioning(
@@ -808,6 +909,8 @@ def _preconditioning(
     diag_right: bool,
     lr_precond: jax.Array,
     noise_scale: float,
+    diag_update_fn: Callable,
+    dense_update_fn: Callable,
 ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     m, n = valid_shape[0], valid_shape[1]
     noise = jax.random.normal(key, G.shape, G.dtype) * noise_scale
@@ -824,11 +927,11 @@ def _preconditioning(
         
         term1L = Pg @ Pg.T
         term2L = total_numel / m
-        Ql_new, Ll_new = _dense_update(term1L, term2L, Ll, Ql, lr_precond)
+        Ql_new, Ll_new = dense_update_fn(term1L, term2L, Ll, Ql, lr_precond)
 
         term1R = Pg.T @ Pg
         term2R = total_numel / n
-        Qr_new, Lr_new = _dense_update(term1R, term2R, Lr, Qr, lr_precond)
+        Qr_new, Lr_new = dense_update_fn(term1R, term2R, Lr, Qr, lr_precond)
 
         Pg_out = jax.numpy.linalg.multi_dot([Ql_new, Ql_new, G, Qr_new, Qr_new])
 
@@ -838,11 +941,11 @@ def _preconditioning(
 
         term1L = jnp.sum(Pg * Pg, axis=1)
         term2L = total_numel / m
-        Ql_new, Ll_new = _diag_update(term1L, term2L, Ll, Ql, lr_precond)
+        Ql_new, Ll_new = diag_update_fn(term1L, term2L, Ll, Ql, lr_precond)
 
         term1R = Pg.T @ Pg
         term2R = total_numel / n
-        Qr_new, Lr_new = _dense_update(term1R, term2R, Lr, Qr, lr_precond)
+        Qr_new, Lr_new = dense_update_fn(term1R, term2R, Lr, Qr, lr_precond)
 
         Pg_out = (Ql_new * Ql_new)[:, None] * jax.numpy.linalg.multi_dot([G, Qr_new, Qr_new])
 
@@ -852,11 +955,11 @@ def _preconditioning(
 
         term1L = Pg @ Pg.T
         term2L = total_numel / m
-        Ql_new, Ll_new = _dense_update(term1L, term2L, Ll, Ql, lr_precond)
+        Ql_new, Ll_new = dense_update_fn(term1L, term2L, Ll, Ql, lr_precond)
 
         term1R = jnp.sum(Pg * Pg, axis=0)
         term2R = total_numel / n
-        Qr_new, Lr_new = _diag_update(term1R, term2R, Lr, Qr, lr_precond)
+        Qr_new, Lr_new = diag_update_fn(term1R, term2R, Lr, Qr, lr_precond)
 
         Pg_out = jax.numpy.linalg.multi_dot([Ql_new, Ql_new, G]) * (Qr_new * Qr_new)[None, :]
 
@@ -866,15 +969,47 @@ def _preconditioning(
 
         term1L = jnp.sum(Pg * Pg, axis=1)
         term2L = total_numel / m
-        Ql_new, Ll_new = _diag_update(term1L, term2L, Ll, Ql, lr_precond)
+        Ql_new, Ll_new = diag_update_fn(term1L, term2L, Ll, Ql, lr_precond)
         
         term1R = jnp.sum(Pg * Pg, axis=0)
         term2R = total_numel / n
-        Qr_new, Lr_new = _diag_update(term1R, term2R, Lr, Qr, lr_precond)
+        Qr_new, Lr_new = diag_update_fn(term1R, term2R, Lr, Qr, lr_precond)
         
         Pg_out = (Ql_new * Ql_new)[:, None] * G * (Qr_new * Qr_new)[None, :]
 
     return Ql_new, Qr_new, Ll_new, Lr_new, Pg_out
+
+
+def _preconditioning_one_d(
+    key: jax.Array,
+    Q: jax.Array,
+    L: jax.Array,
+    G: jax.Array,
+    lr_precond: jax.Array,
+    noise_scale: float,
+    diag_update_fn: Callable,
+) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    noise = jax.random.normal(key, G.shape, G.dtype) * noise_scale
+    Gn = G + noise
+    Pg = Q * Q * Gn
+    term1 = Pg * Pg
+    term2 = 1.0
+    Qn, Ln = diag_update_fn(term1, term2, L, Q, lr_precond)
+    Pg_out = Qn * Qn * G
+    return Qn, Ln, Pg_out
+
+
+def _balance_qs(Ql: jax.Array, Qr: jax.Array) -> Tuple[jax.Array, jax.Array]:
+    @vmap
+    def _balance_sample(ql: jax.Array, qr: jax.Array) -> Tuple[jax.Array, jax.Array]:
+        nl = jnp.max(jnp.abs(ql))
+        nr = jnp.max(jnp.abs(qr))
+        geometric_mean = jnp.sqrt(nl * nr)
+        sL = geometric_mean / nl
+        sR = geometric_mean / nr
+        return ql * sL, qr * sR
+
+    return _balance_sample(Ql, Qr)
 
 
 def _block2d(x: jax.Array, block_size: int) -> Tuple[jax.Array, Tuple[int, int, int, int]]:
