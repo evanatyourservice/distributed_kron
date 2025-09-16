@@ -70,10 +70,8 @@ def scale_by_quad(
     params_partition_specs: Optional[Union[PartitionSpec, List, Tuple, Dict]] = None,
     noise_scale: float = 1e-9,
 ) -> base.GradientTransformation:
-
     dtype = canonicalize_dtype(dtype)
     assert dtype in (jnp.bfloat16, jnp.float32), "dtype must be bfloat16 or float32"
-    assert block_size is None or block_size > 0, "block_size must be positive"
     assert preconditioner_update_style in ("QUAD", "Q0p5EQ1p5"), "preconditioner_update_style must be QUAD or Q0p5EQ1p5"
 
     def init_fn(params):
