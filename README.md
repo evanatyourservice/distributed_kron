@@ -11,12 +11,12 @@ PSGD. There are also resources listed near the bottom of this readme.
 
 ### `distributed_kron`:
 
-The most versatile and easy-to-use PSGD optimizer is `kron`, which uses Kronecker-factored 
+The most versatile and easy-to-use PSGD optimizer is `pro`, which uses Procrustes-based 
 preconditioners. It has less hyperparameters that need tuning than adam, and can generally act as a 
 drop-in replacement.
 
-Distributed kron is a version of kron meant for large scale distributed training in JAX. It uses merging of
-dimensions, vmapping of layers, partitioning of grads, and sharding constraints to allow for easy and efficient
+Distributed kron implements the PRO optimizer meant for large scale distributed training in JAX. It uses blocked
+preconditioners, vmapping of layers, partitioning of grads, and sharding constraints to allow for easy and efficient
 second-order training of large models.
 
 
@@ -28,20 +28,18 @@ pip install distributed-kron
 
 ## Basic Usage
 
-**FYI**: Kron schedules the preconditioner update probability by default to start at 1.0 and anneal to 0.03 
-during the first 4k steps, so training will be slightly slower at the start but will speed up 
-by around 4k steps.
+**FYI**: PRO updates the preconditioner every step, providing consistent performance throughout training.
 
-**Learning Rate**: Kron usually likes a learning rate around 3x smaller than adam's.
+**Learning Rate**: PRO usually works well with learning rates similar to Adam's (e.g., 0.001).
 
-**Weight Decay**: Kron usually likes a weight decay larger than adam's (3-10x larger).
+**Weight Decay**: PRO usually likes a weight decay around 0.1 (can be larger than adam's).
 
 For basic usage, use `distributed_kron` like any other optax optimizer:
 
 ```python
-from distributed_kron import kron
+from distributed_kron import pro
 
-optimizer = kron()
+optimizer = pro()
 opt_state = optimizer.init(params)
 
 updates, opt_state = optimizer.update(grads, opt_state)
@@ -52,9 +50,10 @@ params = optax.apply_updates(params, updates)
 
 See the `kron_example.py` file for a simple example.
 
-The main thing to note is that your workflow should include passing params partition specs into kron through
-`params_partition_specs`, which will be used for internal sharding constraints. Also, it is best to explicitly
-set preconditioner partition specs using `preconditioner_partition_spec` (see hyperparameters section below).
+The main thing to note is that your workflow should include passing params partition specs into pro through
+`params_partition_specs`, which will be used for internal sharding constraints. You can also specify the
+`pipeline_axis_name` for pipeline parallelism (typically 'fsdp') and `pipeline_axis_size` for sharding the
+preconditioner state across devices.
 
 #### `get_opt_state_partition_specs`:
 
@@ -63,105 +62,76 @@ This is a helper function to get the optimizer state partition specs from the pa
 ```python
 from distributed_kron import get_opt_state_partition_specs
 
-kron_kwargs = dict(
-    learning_rate=0.0003,
-    weight_decay=0.01,
+pro_kwargs = dict(
+    learning_rate=0.001,
+    weight_decay=0.1,
     scanned_layers=scanned_layers_pytree,
     params_partition_specs=params_partition_specs,
-    preconditioner_partition_spec=P("fsdp", None),
+    pipeline_axis_name="fsdp",
+    pipeline_axis_size=8,
 )
 
-optimizer = kron(**kron_kwargs)
+optimizer = pro(**pro_kwargs)
 
 opt_state_partition_specs = get_opt_state_partition_specs(
-    params=train_state_shapes["params"], scale_by_kron_only=False, **kron_kwargs  # pass in kwargs
+    params=train_state_shapes["params"], **pro_kwargs  # pass in kwargs
 )
 ```
 
 ## Hyperparameter Descriptions
 
-`learning_rate`: Kron usually likes a learning rate around 3x smaller than adam's.
+`learning_rate`: PRO usually works well with learning rates similar to Adam's (e.g., 0.001).
 
-`weight_decay`: Kron may like a weight decay slightly larger than adam's (1-3x larger).
+`weight_decay`: PRO typically likes a weight decay around 0.1, which can be larger than adam's.
 
-Kron does not have epsilon or beta2.
+`b1`: Momentum coefficient for EMA of gradients (default 0.95).
+
+PRO does not have epsilon or beta2.
 
 **Preconditioner Info:**
 
-*Preconditioner structure*: For a layer with shape (256, 128), default triangular preconditioners would be shapes
-(256, 256) and (128, 128). However, with the following options we can also choose to make some or all of these
-preconditioners diagonal, which would be shapes (256,) and (128,).
+*Preconditioner structure*: PRO uses blocked Procrustes-based preconditioners. For a layer with shape (256, 128),
+preconditioners are organized into blocks of size `block_size` (default 256). Dimensions larger than `max_size_dense`
+(default 16384) automatically use diagonal preconditioners for memory efficiency.
 
-Depending on how the following settings are chosen, `kron` can balance between memory/speed and effectiveness.
-Defaults lead to most precoditioners being triangular except for 1-dimensional layers and very large dimensions.
+`max_size_dense`: Any dimension with size above this value will have a diagonal preconditioner instead of 
+a dense/blocked one. Default is 16384.
 
-`max_size_triangular`: Any dimension with size above this value will have a diagonal preconditioner.
+`block_size`: Size of blocks for the blocked preconditioner. Default is 256. Larger blocks can be more accurate 
+but use more memory.
 
-`min_ndim_triangular`: Any tensor with less than this number of dimensions will have all diagonal 
-preconditioners. Default is 2, so single-dim layers like bias and scale use diagonal preconditioners.
+`preconditioner_lr`: Learning rate for preconditioner updates (default 0.5).
 
-`memory_save_mode`: Can be None, 'one_diag', or 'all_diag'. None is default and lets all 
-preconditioners be triangular. 'one_diag' sets the largest or last dim per layer as diagonal 
-using `np.argsort(shape)[::-1][0]`. 'all_diag' sets all preconditioners to be diagonal.
+`preconditioner_init_scale`: Initial scale for preconditioner (default 1.0).
 
-**Preconditioner update frequency:**
+`preconditioner_update_style`: Either "PRO" (default) or "QUAD" for the update algorithm.
 
-PSGD generally benefits from more preconditioner updates at the start of training, but once the preconditioner
-is learned it's okay to do them less often.
+**Preconditioner updates:**
 
-`preconditioner_update_probability`: Kron schedules preconditioner update probability by default using a schedule
-that works well for most cases. It anneals from 1 to 0.03 at the beginning of training, so training 
-will be slightly slower at the start but will speed up by around 4k steps.
-
-An easy way to adjust update frequency is to pass in your own 
-`precond_update_prob_schedule` function to kron's `preconditioner_update_probability` hyperparameter:
-
-```python
-from distributed_kron import kron, precond_update_prob_schedule
-
-optimizer = kron(
-    preconditioner_update_probability=precond_update_prob_schedule(
-        # update precond every 20 steps
-        min_prob=0.05,  # (default is 0.03)
-        # update precond every step for first 1000 steps before starting to anneal
-        flat_start=1000  # (default is 500)
-    )
-)
-```
-
-This is the default schedule defined in the `precond_update_prob_schedule`:
-
-<img src="assets/default_schedule.png" alt="Default Schedule" width="800" style="max-width: 100%; height: auto;" />
+PRO updates preconditioners every step by default, providing consistent performance throughout training without
+needing scheduling.
 
 <hr style="visibility: hidden; margin: 1em 0;">
 
 **Sharding:**
 
-If you are sharding your params, pass your params' `PartitionSpec`s into `kron` through the 
+If you are sharding your params, pass your params' `PartitionSpec`s into `pro` through the 
 `params_partition_specs` hyperparameter. This will be used for internal sharding constraints.
 
-To shard preconditioners, pass a `PartitionSpec` into the `preconditioner_partition_spec` hyperparameter. Best 
-practice is to set this to something like `P('fsdp', None)` or `P('fsdp', 'tp')`. If `params_partition_specs`
-is set but `preconditioner_partition_spec` is None, a so-so preconditioner sharding strategy will be inferred from 
-`params_partition_specs`.
+To shard preconditioners across pipeline stages, use the `pipeline_axis_name` (typically 'fsdp') and 
+`pipeline_axis_size` parameters. The preconditioner state will be automatically sharded along the specified axis.
 
 **Scanned layers:**
 
-If you are scanning layers in your network, kron can also scan over those arrays internally. 
+If you are scanning layers in your network, PRO can also scan over those arrays internally. 
 Pass in a pytree the same structure as your params with True values indicating scanned arrays 
 and False values indicating non-scanned arrays through the `scanned_layers` hyperparameter. 
-PSGD will vmap over the first dims of those layers. If you need a more advanced scanning setup, 
-please open an issue.
-
-*Scan instead of vmap*: For very large models, the preconditioner update may use too much memory all at once when
-scanning, in which case you can set `lax_map_scanned_layers` to `True` and set `lax_map_batch_size` to a 
-reasonable batch size for your setup (`lax.map` scans over batches of vmap, see JAX docs). If 
-your net is 32 layers and you're hitting OOM during the optimizer step, you can break the model into
-2 or 4 and set `lax_map_batch_size` to 16 or 8 respectively.
+PRO will vmap over the first dims of those layers. You can also pass a callable that takes params
+and returns such a pytree.
 
 <hr style="visibility: hidden; margin: 1em 0;">
 
-***For more hyperparameter info, please see kron's docstring.***
+***For more hyperparameter info, please see pro's docstring.***
 
 ## Resources
 

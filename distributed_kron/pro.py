@@ -54,25 +54,48 @@ class LeafState:
     valid_cols: Optional[jax.Array] = None
 
 
-def scale_by_quad(
+def scale_by_pro(
     lr_style: Optional[str] = "adam",
     b1: float = 0.95,
     normalize_grads: bool = False,
     max_size_dense: int = 16384,
-    preconditioner_lr: float = 0.7,
+    preconditioner_lr: float = 0.5,
     preconditioner_init_scale: float = 1.0,
-    preconditioner_update_style: str = "Q0p5EQ1p5",
-    dtype: Union[str, jnp.dtype] = jnp.bfloat16,
-    scanned_layers: Optional[base.Params] = None,
+    preconditioner_update_style: str = "PRO",
+    dtype: Union[str, jnp.dtype] = jnp.float32,
+    scanned_layers: Optional[Union[base.Params, Callable[[base.Params], base.Params]]] = None,
     block_size: int = 256,
     pipeline_axis_name: Optional[str] = None,
     pipeline_axis_size: int = 1,
     params_partition_specs: Optional[Union[PartitionSpec, List, Tuple, Dict]] = None,
     noise_scale: float = 1e-9,
 ) -> base.GradientTransformation:
+    """PRO preconditioned gradient descent optimizer.
+
+    Args:
+        lr_style: Learning rate style, "adam" scales by 1/5
+        b1: Momentum coefficient for EMA of gradients
+        normalize_grads: Whether to normalize gradients before preconditioning
+        max_size_dense: Max dimension for dense preconditioner (use diagonal above this)
+        preconditioner_lr: Learning rate for preconditioner updates
+        preconditioner_init_scale: Initial scale for preconditioner
+        preconditioner_update_style: "PRO" or "QUAD" update style
+        dtype: Dtype for preconditioner state (bfloat16 or float32)
+        scanned_layers: Either None, a pytree of bools marking scanned params, or a
+            callable that takes params and returns such a pytree. Scanned params are
+            assumed to have a leading dimension from jax.lax.scan (e.g. RepeatableLayer).
+        block_size: Block size for blocked preconditioner
+        pipeline_axis_name: Mesh axis name for pipeline parallelism (typically 'fsdp')
+        pipeline_axis_size: Size of pipeline axis for sharding preconditioner state
+        params_partition_specs: Partition specs for parameter sharding
+        noise_scale: Scale for noise injection in preconditioner updates
+
+    Returns:
+        An optax GradientTransformation
+    """
     dtype = canonicalize_dtype(dtype)
     assert dtype in (jnp.bfloat16, jnp.float32), "dtype must be bfloat16 or float32"
-    assert preconditioner_update_style in ("QUAD", "Q0p5EQ1p5"), "preconditioner_update_style must be QUAD or Q0p5EQ1p5"
+    assert preconditioner_update_style in ("PRO", "QUAD"), "preconditioner_update_style must be PRO or QUAD"
 
     def init_fn(params):
         params_unboxed = jax.tree.map(
@@ -85,7 +108,33 @@ def scale_by_quad(
             if params_partition_specs is not None:
                 mu = with_sharding_constraint(mu, params_partition_specs)
 
-        scanned_flags = scanned_layers if scanned_layers is not None else jax.tree.map(lambda _: False, params_unboxed)
+        # handle scanned_layers as either pytree or callable that creates pytree from params
+        if scanned_layers is None:
+            scanned_flags = jax.tree.map(lambda _: False, params_unboxed)
+        elif callable(scanned_layers):
+            scanned_flags = scanned_layers(params_unboxed)
+        else:
+            scanned_flags = scanned_layers
+
+        # debug logging: show which params are scanned vs non-scanned
+        scanned_paths = []
+        non_scanned_paths = []
+        def collect_paths(path, is_scanned):
+            path_str = '/'.join(str(k.key) for k in path)
+            if is_scanned:
+                scanned_paths.append(path_str)
+            else:
+                non_scanned_paths.append(path_str)
+            return None
+        jax.tree.map_with_path(collect_paths, scanned_flags)
+
+        # print sample paths for debugging
+        print("[PRO Optimizer] Scanned vs Non-Scanned Parameters:")
+        print(f"  Total scanned: {len(scanned_paths)}, Total non-scanned: {len(non_scanned_paths)}")
+        if scanned_paths:
+            print(f"  Example scanned paths (first 3): {scanned_paths[:3]}")
+        if non_scanned_paths:
+            print(f"  Example non-scanned paths (first 3): {non_scanned_paths[:3]}")
 
         dense_Ql_list: List[jax.Array] = []
         dense_Qr_list: List[jax.Array] = []
@@ -355,15 +404,14 @@ def scale_by_quad(
 
     def update_fn(updates: base.Updates, state: dict, params: base.Params | None = None):
         step = safe_int32_increment(state["count"])
-        plr = jnp.maximum(preconditioner_lr * jax.lax.rsqrt(1.0 + step / 10000.0), 0.4)
         balance = jnp.equal(step % 100, 0)
 
         if preconditioner_update_style == "QUAD":
             dense_update_fn = _dense_update
             diag_update_fn = _diag_update
-        elif preconditioner_update_style == "Q0p5EQ1p5":
-            dense_update_fn = _dense_update_q0p5eq1p5
-            diag_update_fn = _diag_update_q0p5eq1p5
+        elif preconditioner_update_style == "PRO":
+            dense_update_fn = _dense_update_pro
+            diag_update_fn = _diag_update_pro
         else:
             raise ValueError(f"Unknown preconditioner_update_style: {preconditioner_update_style}")
 
@@ -454,13 +502,13 @@ def scale_by_quad(
                     valid_shape_dense,
                     diag_left,
                     diag_right,
-                    plr,
+                    preconditioner_lr,
                     noise_scale,
                     diag_update_fn,
                     dense_update_fn,
                 )
-                if pipeline_axis_name is not None:
-                    Pg_cat = with_sharding_constraint(Pg_cat, PartitionSpec(pipeline_axis_name))
+                # if pipeline_axis_name is not None:
+                #     Pg_cat = with_sharding_constraint(Pg_cat, PartitionSpec(pipeline_axis_name))
 
                 state["dense"] = dense_state.replace(
                     Ql=(
@@ -551,13 +599,13 @@ def scale_by_quad(
                     valid_shape_large,
                     True,
                     True,
-                    plr,
+                    preconditioner_lr,
                     noise_scale,
                     diag_update_fn,
                     dense_update_fn,
                 )
-                if pipeline_axis_name is not None:
-                    Pg = with_sharding_constraint(Pg, PartitionSpec(pipeline_axis_name))
+                # if pipeline_axis_name is not None:
+                #     Pg = with_sharding_constraint(Pg, PartitionSpec(pipeline_axis_name))
 
                 state["large"][leaf_idx] = st.replace(
                     Ql=(
@@ -635,13 +683,13 @@ def scale_by_quad(
                     valid_shape_large,
                     diag_left,
                     diag_right,
-                    plr,
+                    preconditioner_lr,
                     noise_scale,
                     diag_update_fn,
                     dense_update_fn,
                 )
-                if pipeline_axis_name is not None:
-                    Pg = with_sharding_constraint(Pg, PartitionSpec(pipeline_axis_name))
+                # if pipeline_axis_name is not None:
+                #     Pg = with_sharding_constraint(Pg, PartitionSpec(pipeline_axis_name))
 
                 state["large"][leaf_idx] = st.replace(
                     Ql=(
@@ -681,7 +729,7 @@ def scale_by_quad(
             keys = jax.random.split(key, B)
 
             Ql_new, Ll_new, Pg_flat = vmap(_preconditioning_one_d, in_axes=(0, 0, 0, 0, None, None, None))(
-                keys, st.Ql, st.Ll, g2d, plr, noise_scale, diag_update_fn
+                keys, st.Ql, st.Ll, g2d, preconditioner_lr, noise_scale, diag_update_fn
             )
 
             state["large"][leaf_idx] = st.replace(Ql=otu.tree_cast(Ql_new, dtype), Ll=otu.tree_cast(Ll_new, jnp.float32))
@@ -713,7 +761,7 @@ def scale_by_quad(
     return base.GradientTransformation(init_fn, update_fn)
 
 
-def quad(
+def pro(
     learning_rate: Union[float, Callable[[int], float]] = 0.001,
     lr_style: Optional[str] = "adam",
     b1: float = 0.95,
@@ -721,11 +769,11 @@ def quad(
     weight_decay_mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None,
     normalize_grads: bool = False,
     max_size_dense: int = 16384,
-    preconditioner_lr: float = 0.7,
+    preconditioner_lr: float = 0.5,
     preconditioner_init_scale: float = 1.0,
-    preconditioner_update_style: str = "Q0p5EQ1p5",
-    dtype: Union[str, jnp.dtype] = jnp.bfloat16,
-    scanned_layers: Optional[base.Params] = None,
+    preconditioner_update_style: str = "PRO",
+    dtype: Union[str, jnp.dtype] = jnp.float32,
+    scanned_layers: Optional[Union[base.Params, Callable[[base.Params], base.Params]]] = None,
     block_size: int = 256,
     pipeline_axis_name: Optional[str] = None,
     pipeline_axis_size: int = 1,
@@ -733,7 +781,7 @@ def quad(
     noise_scale: float = 1e-9,
 ) -> base.GradientTransformation:
     tx = [
-        scale_by_quad(
+        scale_by_pro(
             lr_style=lr_style,
             b1=b1,
             normalize_grads=normalize_grads,
@@ -756,7 +804,7 @@ def quad(
     return chain(*tx)
 
 
-def get_opt_state_partition_specs(params, **quad_kwargs):
+def get_opt_state_partition_specs(params, **pro_kwargs):
     _allowed = {
         "lr_style",
         "b1",
@@ -772,12 +820,12 @@ def get_opt_state_partition_specs(params, **quad_kwargs):
         "params_partition_specs",
         "noise_scale",
     }
-    precond_kwargs = {k: v for k, v in quad_kwargs.items() if k in _allowed}
-    weight_decay = float(quad_kwargs.get("weight_decay", 0.0) or 0.0)  # no weight decay
+    precond_kwargs = {k: v for k, v in pro_kwargs.items() if k in _allowed}
+    weight_decay = float(pro_kwargs.get("weight_decay", 0.0) or 0.0)  # no weight decay
     _no_constraint_kwargs = dict(precond_kwargs)
     _no_constraint_kwargs["params_partition_specs"] = None
     _no_constraint_kwargs["pipeline_axis_name"] = None
-    tx = scale_by_quad(**_no_constraint_kwargs)  # take out sharding args
+    tx = scale_by_pro(**_no_constraint_kwargs)  # take out sharding args
     state_shape = jax.eval_shape(tx.init, params)
     pipeline_axis_name = precond_kwargs.get("pipeline_axis_name", None)
     b1 = precond_kwargs.get("b1", 0.95)
@@ -866,7 +914,7 @@ def _diag_update(term1, term2, L, Q, lr_precond):
     return Qn, L
 
 
-def _diag_update_q0p5eq1p5(term1, term2, L, Q, lr_precond):
+def _diag_update_pro(term1, term2, L, Q, lr_precond):
     ell = jnp.max(term1) + term2
     L = jnp.maximum(betaL * L + (1 - betaL) * ell, ell)
     z = (lr_precond / L).astype(Q.dtype)
@@ -875,22 +923,22 @@ def _diag_update_q0p5eq1p5(term1, term2, L, Q, lr_precond):
     return Qn, L
 
 
-def _norm_lower_bound(key, A, k=4, iters=5, skh=False):
+def _norm_lower_bound(key, A, k=32, iters=2, skh=False):
     if skh:
         scale = jnp.max(jnp.abs(A))
     else:
         scale = jnp.max(jnp.diag(A))
+    scale += jnp.finfo(A.dtype).tiny
     A /= scale
-    mean_energies = jnp.mean(A * A, axis=1, keepdims=False)
-    j = jnp.argmax(mean_energies)
-    power = jax.lax.dynamic_index_in_dim(mean_energies, j, 0, keepdims=False)
+    j = jnp.argmax(jnp.linalg.norm(A, axis=1, keepdims=False))
+    V = jax.random.normal(key, (k, A.shape[1]), A.dtype)
     max_vec = jax.lax.dynamic_index_in_dim(A, j, 0, keepdims=False)
-    x = (max_vec * jax.lax.rsqrt(power) + jax.random.normal(key, (k, A.shape[1]), A.dtype)) @ A
+    V = max_vec + jnp.sign(jnp.sum(max_vec * V.conj(), axis=1, keepdims=True)) * V
     for _ in range(iters):
-        x = x / jnp.max(jnp.abs(x))
-        x = x @ A
-    x = (x / jnp.linalg.vector_norm(x, axis=1, keepdims=True)) @ A
-    return jnp.max(jnp.linalg.vector_norm(x, axis=1, keepdims=False)) * scale
+        V = V @ A 
+        V /= jnp.linalg.norm(V, axis=1, keepdims=True) + jnp.finfo(A.dtype).tiny
+        V = V @ A   
+    return scale * jnp.max(jnp.linalg.norm(V, axis=1, keepdims=False))
 
 
 def _dense_update(key, term1, term2, L, Q, lr_precond):
@@ -903,35 +951,25 @@ def _dense_update(key, term1, term2, L, Q, lr_precond):
     return Qn, L
 
 
-def _dense_update_q0p5eq1p5(key, term1, term2, L, Q, lr_precond):
+def _dense_update_pro(key, term1, term2, L, Q, lr_precond):
     key1, key2 = jax.random.split(key)
     ell = _norm_lower_bound(key1, term1) + term2
     L = jnp.maximum(betaL * L + (1 - betaL) * ell, ell)
     z = (lr_precond / L).astype(Q.dtype)
-    Q_updated = Q - z * (term1 @ Q - term2 * Q)
-    Qn = _procrustes_step(key2, Q_updated)
-    return Qn, L
+    Q = Q - z * (term1 @ Q - term2 * Q)
+    Q = _procrustes_step(key2, Q)
+    return Q, L
 
 
 def _procrustes_step(key, Q, max_step_size=1/8):
     R = Q.T - Q
-    max_abs = jnp.max(jnp.abs(R))
-
-    def inner(R):
-        R = R / max_abs
-        RQ = R @ Q
-        tr_RQ = jnp.trace(RQ)
-
-        def do_rotation():
-            a = max_step_size / _norm_lower_bound(key, R, skh=True)
-            RRQ = R @ RQ
-            tr_RRQ = jnp.trace(RRQ)
-            a = jnp.where(tr_RRQ < 0, jnp.minimum(a, -tr_RQ / tr_RRQ), a)
-            return Q + a * (RQ + 0.5 * a * RRQ)
-
-        return jax.lax.cond(tr_RQ > 0, do_rotation, lambda: Q)
-
-    return jax.lax.cond(max_abs > jnp.finfo(Q.dtype).tiny, lambda: inner(R), lambda: Q)
+    R /= _norm_lower_bound(key, R, skh=True) + jnp.finfo(R.dtype).tiny
+    RQ = R @ Q
+    RRQ = R @ RQ
+    tr_RQ = jnp.trace(RQ)
+    tr_RRQ = jnp.trace(RRQ)
+    a = jnp.where(tr_RRQ < 0, jnp.minimum(-tr_RQ / tr_RRQ, max_step_size), max_step_size)
+    return Q + a * (RQ + 0.5 * a * RRQ)
 
 
 def _preconditioning(
@@ -951,7 +989,8 @@ def _preconditioning(
 ):
     key1, key2 = jax.random.split(key)
     m, n = valid_shape[0], valid_shape[1]
-    noise = jax.random.normal(key2, G.shape, G.dtype) * noise_scale
+    damping = noise_scale + jnp.finfo(G.dtype).eps * jnp.abs(G)
+    noise = jax.random.normal(key2, G.shape, G.dtype) * damping
     rows = jnp.arange(G.shape[0], dtype=jnp.int32) < m
     cols = jnp.arange(G.shape[1], dtype=jnp.int32) < n
     mask = rows[:, None] & cols[None, :]

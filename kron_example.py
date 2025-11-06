@@ -8,55 +8,46 @@ from jax.sharding import Mesh, NamedSharding as NS, PartitionSpec as P
 from jax.experimental.mesh_utils import create_device_mesh
 import optax
 
-from distributed_kron import kron
+from distributed_kron import pro
 
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
 
 
-def main(
-    merge_small_dims: bool = True,
-    partition_grads_into_blocks: bool = True,
-):
+def main():
     devices = create_device_mesh((2, 2))
     mesh = Mesh(devices, ("fsdp", "pipeline"))
 
 
     params_sharding = {
-        "w1_scan": NS(mesh, P("pipeline", None, "fsdp")),  # kron maintains pipeline sharding
+        "w1_scan": NS(mesh, P("pipeline", None, "fsdp")),  # pro maintains pipeline sharding
         "w2": NS(mesh, P("fsdp", None, None)),
         "b1": NS(mesh, P(None)),
     }
 
-    # some inputs for kron
+    # some inputs for pro
     params_partition_specs = jax.tree.map(lambda x: x.spec, params_sharding)  # only specs, not sharding
     scanned_layers = {"w1_scan": True, "w2": False, "b1": False}  # which arrays in model are scanned
-    preconditioner_partition_spec = P("fsdp", None)  # best to explicitly set preconditioner sharding
 
-    kron_kwargs = dict(
-        learning_rate=0.0003,
-        b1=0.9,
-        weight_decay=0.01,
+    pro_kwargs = dict(
+        learning_rate=0.001,
+        b1=0.95,
+        weight_decay=0.1,
         weight_decay_mask=None,
-        max_size_triangular=8192,
-        min_ndim_triangular=2,
-        memory_save_mode=None,
-        mu_dtype="bfloat16",
-        precond_dtype=None,
-        precond_update_precision="tensorfloat32",
-        precond_grads_precision=None,
+        max_size_dense=16384,
+        preconditioner_lr=0.5,
+        preconditioner_init_scale=1.0,
+        preconditioner_update_style="PRO",
+        dtype="float32",
         scanned_layers=scanned_layers,
-        lax_map_scanned_layers=False,
-        lax_map_batch_size=8,
-        merge_small_dims=merge_small_dims,
-        target_merged_dim_size=4096,
-        partition_grads_into_blocks=partition_grads_into_blocks,
-        block_size=512,
+        block_size=256,
+        pipeline_axis_name="fsdp",
+        pipeline_axis_size=2,
         params_partition_specs=params_partition_specs,
-        preconditioner_partition_spec=preconditioner_partition_spec,
+        noise_scale=1e-9,
     )
 
-    optimizer = kron(**kron_kwargs)
+    optimizer = pro(**pro_kwargs)
 
 
     @jax.jit
@@ -107,11 +98,9 @@ def main(
         updates, new_state = test_step(grads, train_state)
 
         """
-        In the printout, you will see the preconditioners at
-        opt_state.Qs_preconditioners.w1_scan will have a partition spec of
-        P('pipeline', None, 'fsdp', None). These dimensions correspond to the
-        scanned dim from scanned_layers (0), stacked grad partitions (1), and
-        the preconditioner matrix dimensions (2, 3).
+        In the printout, you will see the preconditioner state sharded along
+        the pipeline axis (fsdp). PRO maintains efficient sharding of both
+        dense and large preconditioner blocks.
         """
         print("OUTPUT UPDATES SHARDING:")
         pprint_tree(updates, shardings=True)
@@ -126,4 +115,4 @@ def pprint_tree(tree, shardings=False):
 
 
 if __name__ == "__main__":
-    main(merge_small_dims=True, partition_grads_into_blocks=True)
+    main()
